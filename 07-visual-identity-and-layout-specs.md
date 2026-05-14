@@ -1,6 +1,9 @@
-# 🎨 07-VISUAL-IDENTITY-AND-LAYOUT-SPECS — GREENFORGE v2.1.1
+# 🎨 07-VISUAL-IDENTITY-AND-LAYOUT-SPECS — GREENFORGE v2.2
 
 ## Master Design Specification for Pixel-Perfect Implementation
+
+> **Versão:** 2.2 | **Data:** 2026-05-14
+> **Mudanças v2.2:** Monaco Editor → CodeMirror 6 (ADR-11); Cross-reference para `08-motion-grammar-and-dynamic-states.md`.
 
 ---
 
@@ -268,7 +271,7 @@ Cada agente possui uma assinatura cromática única e obrigatória.
 
 - A cor do texto principal é Branco Puro.
 
-- O subtexto "v2.1.1" deve ser discreto.
+- O subtexto "v2.2" deve ser discreto.
 
 ### 3.2 Componente: `ProjectSelector`
 
@@ -374,29 +377,95 @@ Cada agente possui uma assinatura cromática única e obrigatória.
 
 ## 6. ESPECIFICAÇÃO DA COLUNA 3: PAINEL DE ARTEFATOS (EDITOR)
 
-### 6.1 Componente: `MultiTabEditor`
+### 6.1 Componente: `MultiTabEditor` (CodeMirror 6)
+
+> **v2.2 — ADR-11:** Monaco Editor foi substituido por **CodeMirror 6**.
+> Razão: ContentWidgets do Monaco não são React-managed e causam dessincronia de estado
+> em re-renders. CodeMirror 6 usa `StateField` e `ViewPlugin` integrados ao ciclo imutável
+> do React/Zustand sem conflitos de DOM.
 
 - Abas horizontais no topo com os nomes dos arquivos abertos.
-
 - Um botão `x` para fechar abas individualmente.
-
 - Destaque visual na aba que está sendo visualizada.
+- O editor **CodeMirror 6** deve ocupar `100%` do espaço restante.
+- Deve suportar temas customizados via `@codemirror/theme-one-dark` ou equivalente.
 
-- O editor Monaco deve ocupar `100%` do espaço restante.
+#### Configuração Base do CodeMirror 6
+```typescript
+// src/components/Editor/CodeMirrorEditor.tsx
+import { EditorView, basicSetup } from 'codemirror';
+import { javascript } from '@codemirror/lang-javascript';
+import { EditorState } from '@codemirror/state';
 
-- Deve suportar temas customizados do VS Code.
+const state = EditorState.create({
+  doc: initialContent,
+  extensions: [
+    basicSetup,
+    javascript({ typescript: true }),
+    agentTagDecorations,   // Extensão customizada — ver 6.2
+    EditorView.editable.of(!isReadOnly), // readOnly durante Gates
+    EditorView.theme({ '&': { fontFamily: 'JetBrains Mono, monospace', fontSize: '12px' } }),
+  ],
+});
+```
 
-### 6.2 Componente: `InlineAgentWidget`
+### 6.2 Componente: `InlineAgentWidget` (CodeMirror 6 Decorations API)
 
-- Pequenos balões que aparecem diretamente sobre as linhas de código.
+> **v2.2:** Implementado via `StateField` + `Decoration.mark()` do CM6.
+> Tags surgem como `Decoration` imutáveis vinculadas a ranges de texto —
+> sem ContentWidgets de DOM flutuante que causem dessincronia.
 
-- Indicam qual agente sugeriu aquela linha específica.
+```typescript
+// src/components/Editor/agentTagDecorations.ts
+import { StateField, StateEffect, RangeSetBuilder } from '@codemirror/state';
+import { Decoration, DecorationSet, EditorView } from '@codemirror/view';
+
+// Efeito para adicionar/remover tags de agentes
+export const addAgentTag = StateEffect.define<{ from: number; to: number; agentId: string }>();
+export const clearAgentTags = StateEffect.define<void>();
+
+// Marcação de linha com cor do agente
+const agentMark = (agentId: string) => Decoration.mark({
+  class: `agent-tag agent-${agentId}`,  // CSS: border-left, background-color
+  attributes: { 'data-agent': agentId },
+});
+
+export const agentTagField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(decos, tr) {
+    decos = decos.map(tr.changes);
+    for (const effect of tr.effects) {
+      if (effect.is(addAgentTag)) {
+        decos = decos.update({ add: [agentMark(effect.value.agentId).range(effect.value.from, effect.value.to)] });
+      }
+      if (effect.is(clearAgentTags)) decos = Decoration.none;
+    }
+    return decos;
+  },
+  provide: f => EditorView.decorations.from(f),
+});
+
+export const agentTagDecorations = [agentTagField];
+```
+
+**CSS para as tags:**
+```css
+.agent-tag { border-left: 3px solid; padding-left: 4px; }
+.agent-technical_proposer { border-color: #8b5cf6; background: rgba(139,92,246,0.07); }
+.agent-quality_critic     { border-color: #06b6d4; background: rgba(6,182,212,0.07);  }
+.agent-debate_judge       { border-color: #22c55e; background: rgba(34,197,94,0.07);  }
+```
+
+**Conflito simultâneo (dois agentes na mesma linha):**
+Quando `addAgentTag` é chamado com dois agentIds diferentes para o mesmo range:
+- A linha recebe AMBAS as classes CSS (`agent-technical_proposer agent-quality_critic`)
+- CSS exibe gradiente de borda: `border-image: linear-gradient(#8b5cf6, #06b6d4) 1`
+- Tooltip via `Decoration.widget()` explica o conflito
+- Ver especificação de comportamento completa em `../08-motion-grammar-and-dynamic-states.md § 3.2`
 
 - Clicar no widget expande o raciocínio detalhado do agente.
-
 - Devem ser visualmente discretos para não atrapalhar o código.
-
-- A cor da tag deve seguir a identidade do agente.
+- A cor da tag deve seguir a identidade do agente (ver seção 2.2).
 
 ### 6.3 Componente: `IntegratedTerminalLogs`
 
@@ -454,45 +523,54 @@ Cada agente possui uma assinatura cromática única e obrigatória.
 
 ## 8. DESIGN DE MOVIMENTO E MICRO-INTERAÇÕES
 
-### 8.1 Transições de Layout
+> **v2.2:** Esta seção define os princípios. Para a especificação completa e determinística,
+> consulte [`../08-motion-grammar-and-dynamic-states.md`](../08-motion-grammar-and-dynamic-states.md).
+> Aquele documento é o contrato de implementação — este é o resumo de design.
 
-- O fechamento de sidebars deve ser animado em 300ms.
+### 8.1 Hierarquia de Urgência
 
-- O fade-in de novas mensagens deve durar 150ms.
+| Nível | Tipo | Exemplos | Comportamento |
+|---|---|---|---|
+| **L1** | Sinalização Passiva | Agente pensando, progresso | Loop suave, sem interrupção |
+| **L2** | Sinalização Ativa | Gate aberto, decisão requerida | Persiste até ação do usuário |
+| **L3** | Sinalização de Pânico | Falha crítica, violação de segurança | Imediato, bloqueante |
 
-- O redimensionamento de colunas deve ser fluido.
+### 8.2 Tokens de Tempo (Design System)
 
-### 8.2 Feedback de Hover
+| Token | Valor | Uso |
+|---|---|---|
+| `--dur-micro` | `100ms` | Hover states, cor de botão |
+| `--dur-fast` | `200ms` | Tags, badges, dots |
+| `--dur-normal` | `350ms` | Cards, slides, overlays |
+| `--dur-slow` | `600ms` | Modais, transições de estado |
+| `--dur-panic` | `50–150ms` | Estados L3 |
 
-- Botões devem mudar de opacidade ou brilhar levemente.
+### 8.3 Curvas Padrão
 
-- Itens de lista devem ter um fundo sutil.
-
-- O cursor deve mudar para `pointer` em elementos clicáveis.
+| Nome | Curva CSS | Uso |
+|---|---|---|
+| Entrada | `cubic-bezier(0.16, 1, 0.3, 1)` | Gates, overlays, cards |
+| Saída | `cubic-bezier(0.7, 0, 0.84, 0)` | Dismissals, fade-outs |
+| Feedback | `cubic-bezier(0.34, 1.56, 0.64, 1)` | Micro-interações de confirmação |
+| Pânico | `linear` | Estados de erro crítico |
 
 ---
 
-## 9. CHECKLIST TÉCNICO PARA GERAÇÃO DE CÓDIGO
+## 9. CHECKLIST TÉCNICO PARA GERAÇÃO DE CÓDIGO (v2.2)
 
 - [ ] Implementar Layout 3 colunas via CSS Grid.
-
-- [ ] Configurar Temas Dark/Light via Tailwind.
-
-- [ ] Integrar Monaco Editor com abas dinâmicas.
-
+- [ ] Configurar Design System (tokens CSS, dark mode).
+- [ ] Integrar **CodeMirror 6** com extensões typescript + `agentTagDecorations`.
+- [ ] Implementar `RAFBufferedSSEConsumer` (sem setState direto no onmessage).
+- [ ] Implementar `ClientReorderBuffer` (timeout 5s, ação determinística de descarte).
 - [ ] Desenvolver Componente de Chat com Streaming.
-
-- [ ] Criar Widgets de Inline Agent Tags.
-
-- [ ] Implementar Terminal via xterm.js.
-
-- [ ] Adicionar Toasts de Notificação via Sonner.
-
-- [ ] Validar Acessibilidade WCAG 2.1 AA.
-
-- [ ] Garantir que o estado do Gate seja persistente.
-
-- [ ] Otimizar performance de renderização do Diff.
+- [ ] Criar `agentTagField` (StateField CM6) para Inline Agent Tags.
+- [ ] Implementar Terminal via **Xterm.js** (não node-pty direto no frontend).
+- [ ] Implementar `MotionController` conforme `08-motion-grammar-and-dynamic-states.md`.
+- [ ] Adicionar Toasts de Notificação (Sonner ou equiv.).
+- [ ] Validar Acessibilidade WCAG 2.1 AA + `prefers-reduced-motion`.
+- [ ] Garantir que estado do Gate é persistente (Zustand persistência + Gate Hydration).
+- [ ] Otimizar performance de renderização do Diff (virtualização para diffs > 500 linhas).
 
 ---
 
@@ -595,8 +673,8 @@ Criação da especificação base.
 ### v2.0.0 (2026-05-12)
 Atualização para arquitetura de debate agêntico.
 
-### v2.1.1 (2026-05-13)
-Refinamento milimétrico e densidade visual master.
+### v2.2 (2026-05-14)
+Migração Monaco → CodeMirror 6 (ADR-11). InlineAgentWidget via `StateField` + `Decoration.mark()`. Motion spec movida para `08-motion-grammar-and-dynamic-states.md`. Checklist atualizado.
 
 ---
 
@@ -684,26 +762,16 @@ Quando um agente inicia processamento:
 ## 19. DETALHAMENTO DE COMPORTAMENTO HITL (HUMAN-IN-THE-LOOP)
 
 - Quando um Gate é lançado, a aplicação deve entrar em modo de suspensão parcial.
-
 - O fundo do chat central deve mudar para um gradiente sutil da cor do Gate.
-
-- Um som de alerta de baixa frequência deve ser emitido.
-
-- O botão de aprovação deve ter um efeito de pulso para chamar a atenção.
-
-- O usuário pode adicionar comentários ao Gate antes de aprová-lo.
-
-- Se o Gate for rejeitado, os agentes devem voltar ao estágio de debate.
-
-- O Gate deve mostrar o progresso da tarefa (ex: "Passo 2 de 5").
-
+- **NÃO emitir som de alerta** — ambiente de trabalho; acessibilidade; sem controle do usuário. (Ver Regras de Eliminação em `08-motion-grammar-and-dynamic-states.md § 6`).
+- O botão de aprovação deve ter efeito de pulso (3 ciclos de 2s, depois para).
+- O usuário pode adicionar comentários ao Gate antes de aprova-lo.
+- Se o Gate for rejeitado, o card executa shake horizontal (10Hz, 300ms) antes de sair.
+- O Gate deve mostrar o progresso da tarefa (ex: "Gate 1 de 3").
 - Deve haver um botão de "Ver Logs de Debate" dentro do card do Gate.
-
 - O Gate de G2 deve permitir a visualização de Diffs lado a lado e unificado.
-
-- A aprovação de um Gate deve ser registrada com um timestamp e ID de usuário.
-
-- Se o usuário tentar fechar a aba com um Gate pendente, um aviso deve aparecer.
+- A aprovação de um Gate deve ser registrada com timestamp e ID do gateId (idempotente).
+- Se o usuário tentar fechar a aba com um Gate pendente, um aviso `beforeunload` deve aparecer.
 
 ---
 
