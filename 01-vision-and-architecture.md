@@ -239,6 +239,66 @@ interface FileScore {
 
 ---
 
+## 5.3 Resiliência Arquitetural — Fundamentos Teóricos (v2.3)
+
+> **Fonte:** Pesquisa Técnica Profunda v2.3. Esta seção documenta o *porquê* das decisões de resiliência, complementando os ADRs (que documentam o *o quê* e o *como*). Após lê-la, a equipe não precisa consultar os dossiês externos.
+
+### O Problema Raiz: Dois Sistemas Sem Commit Atômico Compartilhado
+
+O GreenForge opera sobre dois sistemas de estado heterogêneos:
+- **Git filesystem** — operações como `git stash push` são duráveis mas não têm transação SQL
+- **SQLite DB** — transações ACID mas limitadas ao banco; sem coordenação com o Git
+
+A limitação crítica: transações que envolvem mudanças contra múltiplos databases `ATTACH`ed no SQLite são atômicas para cada database individual, **mas não são atômicas através de todos os databases como conjunto**. Logo, **nenhum mecanismo nativo resolve a atomicidade cross-system** — Git + SQLite precisam de um coordenador externo.
+
+### Solução: Write-Ahead Log como Fonte de Verdade
+
+O princípio WAL (Write-Ahead Logging) é a resposta formal da ciência de banco de dados para esse problema: as mudanças são **primeiro registradas em um log append-only e durável** antes de serem aplicadas ao estado principal. Se o sistema crashar, o log é replayed no restart — garantindo que a operação seja eventualmente aplicada ou desfeita de forma consistente.
+
+No GreenForge, o Intent Log em `.greenforge/wal/{txId}.json` é esse coordenador: ele registra a **intenção** e a **fase** de cada operação cross-system antes de qualquer side-effect. O `bootReconciler()` é o mecanismo de replay no startup.
+
+### Mecanismo de Sobrevivência ao SIGKILL — Rename Atômico POSIX
+
+A técnica de escrita atômica no filesystem:
+
+```
+1. Serializar intent → escrever em {txId}.json.tmp
+2. fsync({txId}.json.tmp)    ← força flush para disco antes de continuar
+3. rename(.tmp → .json)      ← operação POSIX atômica e indivisível
+```
+
+O `rename(2)` é **indivisível mesmo sob SIGKILL**: ou o arquivo antigo existe, ou o novo — nunca um estado intermediário. Arquivos `.tmp` residuais são evidência de crash *durante* o próprio `writeIntent()` e são limpos pelo `cleanOrphanedTempFiles()` no próximo boot.
+
+**Trade-off documentado:** O `fsync()` adiciona ~5-10ms por checkpoint. Esta latência é o preço explícito pelo contrato "zero stashes órfãos".
+
+### Imunidade Semântica a Loops — Code Property Graph (CPG)
+
+O LoopDetector v2.2 (Tiers AST/SimHash/SHA-256) falha em **reformulações arquiteturais**: um agente que transforma recursão em iteração com `while`, depois com `for`, depois com `reduce()` produz AST, shingles e hashes completamente distintos — evadindo todos os Tiers.
+
+A solução v2.3 baseia-se na teoria do **Code Property Graph (CPG)**: uma estrutura de dados que captura estrutura sintática, fluxo de controle e dependências de dados em um único grafo, obtida pela fusão de:
+- **AST** (Abstract Syntax Tree) — estrutura sintática
+- **CFG** (Control Flow Graph) — fluxo de execução
+- **DFG** (Data Flow Graph) — dependências entre valores
+
+O `CPGLoopDetector` extrai um vetor CPG de cada round e calcula similaridade semântica com pesos:
+- **60% — Execution Oracle** (hash normalizado do output dos testes): se os testes passam igual, o código é funcionalmente equivalente — independente de paradigma
+- **30% — Node type frequency** (AST layer): mesmos constructs linguísticos
+- **10% — Control depth** (CFG layer): proxy de complexidade de fluxo
+
+**Paradigm-shift proof:** `if → switch` muda o `nodeTypeFreq` mas **não** o `sideEffectHash`. Se o oracle registra invariância por `MIN_ROUNDS=3` rounds, é `INVARIANT_SIDE_EFFECTS`. Se os vetores CPG formam um ciclo de comprimento N com similaridade > 0.85, é `CPG_CYCLE`.
+
+### Mapa de Resiliência por Componente
+
+| Componente | Falha Coberta | Mecanismo | Arquivo de Spec |
+|---|---|---|---|
+| `bootReconciler()` | SIGKILL entre Git e DB | WAL Intent Log (3 fases) + rename POSIX | `03-technical-spec-and-data.md §1.3` |
+| `CPGLoopDetector` | Loop semântico por paradigm shift | CPG vector + Execution Oracle | `03-technical-spec-and-data.md §2.8` |
+| `PreExecutionGuard` | Stale Approval / Worktree divergido | OCC version token + HMAC + Worktree Hash | `03-technical-spec-and-data.md §2.10` |
+| `secureGit()` | Argument injection / Path traversal | Allowlist + `realpath()` + env sanitization | `05-governance-and-security.md §4.3` |
+| `OutboxEvent` + `epoch_id` | Gate Zumbi pós-restart | Fencing Token monotônico persistido | `03-technical-spec-and-data.md §5.1` |
+
+---
+
 ## 6. ADRs — Decisões Arquiteturais (com Alternativas Rejeitadas)
 
 > **Regra NEXUS:** Toda escolha tecnológica deve ter alternativa rejeitada documentada com motivo. Decisão sem contexto é dogma.

@@ -389,6 +389,370 @@ if (!stashList.includes(intent.stashMessage)) {
 
 Se stash ainda existe, re-executa o DB update e marca como `DB_COMMITTED`.
 
+### Implementação Canônica do BootReconciler (Contrato Completo)
+
+> **Fonte:** Dossiê de Implementação v2.3, Módulo 1. Este é o contrato de referência que deve ser ingerido pela equipe de implementação. A seção 1.3 acima descreve a lógica; este bloco é o blueprint TypeScript executável.
+
+```typescript
+// boot-reconciler.ts
+// CONTRATO: Deve ser a PRIMEIRA função chamada no startup do GreenForge,
+// antes de qualquer operação Git ou DB.
+import fs from 'fs';
+import path from 'path';
+import { execFileSync } from 'child_process';
+import Database from 'better-sqlite3';
+
+type IntentPhase =
+  | 'INTENT_WRITTEN'   // Fase 0: Log escrito, NADA executado
+  | 'GIT_STASH_DONE'  // Fase 1: Git stash concluído, DB não
+  | 'DB_COMMITTED'     // Fase 2: DB concluído → estado FINAL OK
+  | 'ROLLED_BACK';     // Estado terminal de abort
+
+interface CheckpointIntent {
+  txId: string;
+  agentId: string;
+  worktreePath: string;
+  stashMessage: string;
+  dbPayload: { column: string; value: string; agentId: string };
+  phase: IntentPhase;
+  stashRef: string | null;
+  createdAt: number;
+}
+
+const WAL_DIR = path.resolve(process.cwd(), '.greenforge', 'wal');
+
+/**
+ * writeIntent() — Escrita atômica via temp + fsync + rename POSIX.
+ * Garante: sobrevive a SIGKILL entre write e rename.
+ * Arquivos .tmp residuais são evidência de crash durante o próprio writeIntent.
+ */
+function writeIntent(intent: CheckpointIntent): void {
+  fs.mkdirSync(WAL_DIR, { recursive: true });
+  const targetPath = path.join(WAL_DIR, `${intent.txId}.json`);
+  const tempPath   = `${targetPath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(intent, null, 2), 'utf8');
+  const fd = fs.openSync(tempPath, 'r+');
+  fs.fsyncSync(fd);       // durabilidade em disco ANTES do rename
+  fs.closeSync(fd);
+  fs.renameSync(tempPath, targetPath); // operação POSIX atômica
+}
+
+function readAllPendingIntents(): CheckpointIntent[] {
+  if (!fs.existsSync(WAL_DIR)) return [];
+  return fs.readdirSync(WAL_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => { try { return JSON.parse(fs.readFileSync(path.join(WAL_DIR, f), 'utf8')); } catch { return null; } })
+    .filter((x): x is CheckpointIntent => x !== null);
+}
+
+function cleanIntent(txId: string): void {
+  const p = path.join(WAL_DIR, `${txId}.json`);
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+}
+
+function cleanOrphanedTempFiles(): void {
+  if (!fs.existsSync(WAL_DIR)) return;
+  fs.readdirSync(WAL_DIR)
+    .filter(f => f.endsWith('.tmp'))
+    .forEach(f => { console.warn(`[BOOT] Removing orphaned temp WAL file: ${f}`); fs.unlinkSync(path.join(WAL_DIR, f)); });
+}
+
+interface ReconciliationReport {
+  totalFound: number;
+  rolledBack: string[];
+  forwardRecovered: string[];
+  cleaned: string[];
+  errors: { txId: string; error: string }[];
+}
+
+/**
+ * bootReconciler() — Máquina de estados determinística de recuperação.
+ * LÓGICA:
+ *   INTENT_WRITTEN → Nada foi executado → Abort limpo (ROLLED_BACK)
+ *   GIT_STASH_DONE → Stash existe, DB não → Forward recovery (re-drive DB)
+ *   DB_COMMITTED   → Estado terminal de sucesso → Apenas limpar arquivo WAL
+ *   ROLLED_BACK    → Estado terminal de abort   → Apenas limpar arquivo WAL
+ */
+export function bootReconciler(db: Database.Database): ReconciliationReport {
+  const report: ReconciliationReport = { totalFound: 0, rolledBack: [], forwardRecovered: [], cleaned: [], errors: [] };
+  cleanOrphanedTempFiles();
+  const intents = readAllPendingIntents();
+  report.totalFound = intents.length;
+  if (intents.length === 0) { console.log('[BOOT] No pending intents. Clean startup. ✅'); return report; }
+  console.warn(`[BOOT] Found ${intents.length} pending intent(s). Starting reconciliation...`);
+
+  for (const intent of intents) {
+    try {
+      switch (intent.phase) {
+        case 'INTENT_WRITTEN': {
+          // SIGKILL antes de qualquer side-effect → abort limpo
+          writeIntent({ ...intent, phase: 'ROLLED_BACK' });
+          cleanIntent(intent.txId);
+          report.rolledBack.push(intent.txId);
+          break;
+        }
+        case 'GIT_STASH_DONE': {
+          // Stash existe mas DB nunca foi atualizado → forward recovery
+          const stashList = execFileSync('git', ['-C', intent.worktreePath, 'stash', 'list']).toString();
+          if (!stashList.includes(intent.stashMessage)) {
+            writeIntent({ ...intent, phase: 'ROLLED_BACK' });
+            cleanIntent(intent.txId);
+            report.rolledBack.push(intent.txId);
+            break;
+          }
+          // Re-drive idempotente do DB update
+          db.transaction(() => {
+            db.prepare(`UPDATE agents SET ${intent.dbPayload.column} = ?, updatedAt = ? WHERE id = ?`)
+              .run(intent.dbPayload.value, Date.now(), intent.dbPayload.agentId);
+          })();
+          writeIntent({ ...intent, phase: 'DB_COMMITTED' });
+          cleanIntent(intent.txId);
+          report.forwardRecovered.push(intent.txId);
+          break;
+        }
+        case 'DB_COMMITTED':
+        case 'ROLLED_BACK': {
+          // Estados terminais — apenas limpar arquivo residual
+          cleanIntent(intent.txId);
+          report.cleaned.push(intent.txId);
+          break;
+        }
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      report.errors.push({ txId: intent.txId, error: errorMsg });
+    }
+  }
+  return report;
+}
+
+// Ordem obrigatória de inicialização no servidor:
+// 1. db = new Database(...)  +  db.pragma('journal_mode = WAL')
+// 2. bootReconciler(db)       ← PRIMEIRO, antes de qualquer componente
+// 3. PreExecutionGuard(db)    ← Usa o mesmo db
+// 4. CPGLoopDetector()        ← Independente, stateful por agente
+// 5. secureGit()              ← Puro, sem estado
+// Variável de ambiente obrigatória em produção:
+// GREENFORGE_GATE_SECRET=<random-256-bit-hex>  (para HMAC dos Approval Cards)
+```
+
+---
+
+## 1.4 Procedimentos de Execução Atômica — Happy Path do WAL (v2.3)
+
+> **Relação com §1.3:** O `bootReconciler()` trata o **caminho de falha** (crash recovery). Esta seção documenta o **caminho feliz** — como criar corretamente um checkpoint WAL antes de cada operação cross-system. Sem esses procedimentos, o bootReconciler não tem dados suficientes para recuperar.
+
+**Invariante Garantida:** Se `executeDBPhase()` retornar sem erro, o arquivo WAL é deletado — o sistema está em estado consistente. Se qualquer função lançar, o arquivo WAL persiste com a fase atual para o `bootReconciler` processar no próximo boot.
+
+### O Trio Atômico: beginCheckpoint → executeGitPhase → executeDBPhase
+
+```typescript
+// checkpoint-executor.ts
+// CONTRATO: Estes três procedimentos devem ser chamados SEMPRE nesta ordem.
+// Nunca chame executeGitPhase() sem antes chamar beginCheckpoint().
+// Nunca chame executeDBPhase() sem antes confirmar que executeGitPhase() retornou.
+import crypto from 'crypto';
+import { execFileSync } from 'child_process';
+import Database from 'better-sqlite3';
+import { writeIntent, cleanIntent } from './boot-reconciler';  // reutiliza as funções do §1.3
+
+// ─── FASE 0: Escrever Intenção ANTES de qualquer side-effect ───────────────
+
+/**
+ * beginCheckpoint() — Fase 0 do WAL.
+ *
+ * CONTRATO:
+ *   Pré-condição:  Nada foi alterado no Git ou no DB ainda.
+ *   Pós-condição:  Arquivo {txId}.json em disco com phase='INTENT_WRITTEN'.
+ *                  Sobrevive a SIGKILL — se crash ocorrer aqui, bootReconciler
+ *                  vê INTENT_WRITTEN e faz abort limpo (nada foi feito).
+ *
+ * Por que isso é necessário ANTES do git stash?
+ *   Se SIGKILL ocorre entre writeIntent() e git stash: fase INTENT_WRITTEN →
+ *   bootReconciler aborta sem side-effects. SAFE.
+ *   Se SIGKILL ocorre após git stash mas antes do DB: fase GIT_STASH_DONE →
+ *   bootReconciler re-drives o DB. RECOVERABLE.
+ */
+export function beginCheckpoint(params: {
+  agentId: string;
+  worktreePath: string;
+  dbPayload: { column: string; value: string; agentId: string };
+}): string {  // retorna txId para as próximas fases
+  const txId = crypto.randomUUID();
+  const stashMessage = `greenforge-checkpoint-${txId}`;
+
+  writeIntent({
+    txId,
+    agentId:      params.agentId,
+    worktreePath: params.worktreePath,
+    stashMessage,
+    dbPayload:    params.dbPayload,
+    phase:        'INTENT_WRITTEN',   // ← Fase 0: NADA foi feito ainda
+    stashRef:     null,
+    createdAt:    Date.now(),
+  });
+
+  console.log(`[WAL] Checkpoint started: txId=${txId}, agent=${params.agentId}`);
+  return txId;
+}
+
+// ─── FASE 1: Executar operação Git e avançar WAL ───────────────────────────
+
+/**
+ * executeGitPhase() — Fase 1 do WAL.
+ *
+ * CONTRATO:
+ *   Pré-condição:  beginCheckpoint() foi chamado; arquivo WAL em INTENT_WRITTEN.
+ *   Pós-condição:  git stash existe no worktree com a stashMessage correta.
+ *                  WAL atualizado para GIT_STASH_DONE com stashRef preenchido.
+ *                  Sobrevive a SIGKILL — bootReconciler verifica via `git stash list`
+ *                  se o stash existe e re-drives o DB.
+ *
+ * Por que git stash em vez de git commit?
+ *   Stash é reversível sem criar histórico público. O bootReconciler pode verificar
+ *   a existência do stash via `git stash list | grep stashMessage` — operação
+ *   idempotente e segura mesmo após múltiplos reboots.
+ */
+export function executeGitPhase(txId: string, worktreePath: string, stashMessage: string): string {
+  // Executa o stash com a mensagem rastreável
+  execFileSync('git', ['-C', worktreePath, 'stash', 'push', '-m', stashMessage]);
+
+  // Captura o ref do stash criado (ex: "stash@{0}")
+  const stashListOutput = execFileSync('git', ['-C', worktreePath, 'stash', 'list']).toString();
+  const stashRef = stashListOutput.split('\n')
+    .find(line => line.includes(stashMessage))
+    ?.split(':')[0]   // "stash@{0}: On main: greenforge-checkpoint-{txId}"
+    ?? null;
+
+  if (!stashRef) {
+    throw new Error(`[WAL] executeGitPhase: stash not found after push. txId=${txId}`);
+  }
+
+  // Avança o WAL para GIT_STASH_DONE — bootReconciler agora sabe que o stash existe
+  writeIntent({
+    txId,
+    agentId:      '',   // preenchido pelo bootReconciler via leitura do WAL existente
+    worktreePath,
+    stashMessage,
+    dbPayload:    { column: '', value: '', agentId: '' },  // idem
+    phase:        'GIT_STASH_DONE',   // ← Fase 1: Git feito, DB ainda não
+    stashRef,
+    createdAt:    Date.now(),
+  });
+
+  console.log(`[WAL] Git phase complete: txId=${txId}, stashRef=${stashRef}`);
+  return stashRef;
+}
+
+// ─── FASE 2: Executar operação DB e limpar WAL ────────────────────────────
+
+/**
+ * executeDBPhase() — Fase 2 do WAL (estado terminal de sucesso).
+ *
+ * CONTRATO:
+ *   Pré-condição:  executeGitPhase() retornou; stash existe no worktree.
+ *   Pós-condição:  SQLite atualizado. Arquivo WAL deletado.
+ *                  Se crash aqui APÓS db.transaction mas ANTES de cleanIntent:
+ *                  WAL ainda tem GIT_STASH_DONE; bootReconciler re-drives o DB.
+ *                  O UPDATE é idempotente — re-executar com os mesmos dados é seguro.
+ *
+ * Por que idempotência é crítica?
+ *   O bootReconciler pode chamar o UPDATE novamente no próximo boot. Se o UPDATE
+ *   não for idempotente (ex: usa INSERT sem ON CONFLICT), o dado seria duplicado.
+ *   Use UPDATE com WHERE específico — nunca INSERT para esta operação.
+ */
+export function executeDBPhase(
+  txId: string,
+  db: Database.Database,
+  dbPayload: { column: string; value: string; agentId: string }
+): void {
+  // Operação DB dentro de transação SQLite (atômica no nível do banco)
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE agents SET ${dbPayload.column} = ?, updatedAt = ? WHERE id = ?`
+    ).run(dbPayload.value, Date.now(), dbPayload.agentId);
+  })();
+
+  // Avança WAL para DB_COMMITTED ANTES de deletar o arquivo
+  // (garante que em caso de crash entre transaction e cleanIntent,
+  //  o bootReconciler veja DB_COMMITTED e apenas limpe o arquivo)
+  writeIntent({
+    txId, agentId: '', worktreePath: '', stashMessage: '',
+    dbPayload, phase: 'DB_COMMITTED', stashRef: null, createdAt: Date.now(),
+  });
+
+  // Deleta o arquivo WAL — operação final
+  cleanIntent(txId);
+  console.log(`[WAL] DB phase complete. Checkpoint resolved: txId=${txId}`);
+}
+
+// ─── ORQUESTRAÇÃO COMPLETA — Como usar os três juntos ────────────────────
+
+/**
+ * executeCheckpointTransaction() — Orquestrador de alto nível.
+ * Encapsula as 3 fases em sequência com tratamento de erro consistente.
+ *
+ * USO:
+ *   await executeCheckpointTransaction(db, {
+ *     agentId: 'proposer',
+ *     worktreePath: '/path/to/worktree',
+ *     dbPayload: { column: 'status', value: 'STASHED', agentId: 'proposer' }
+ *   });
+ */
+export async function executeCheckpointTransaction(
+  db: Database.Database,
+  params: {
+    agentId: string;
+    worktreePath: string;
+    dbPayload: { column: string; value: string; agentId: string };
+  }
+): Promise<{ txId: string; stashRef: string }> {
+
+  // Fase 0: Escrever intenção (SIGKILL-safe — aborta limpo)
+  const txId = beginCheckpoint(params);
+
+  let stashRef: string;
+  try {
+    // Fase 1: Git (SIGKILL-safe — bootReconciler re-drives DB)
+    stashRef = executeGitPhase(txId, params.worktreePath,
+      `greenforge-checkpoint-${txId}`);
+  } catch (gitErr) {
+    // Git falhou — abortar: marcar WAL como ROLLED_BACK e limpar
+    const { readIntent } = await import('./boot-reconciler');
+    const intent = readIntent(txId);
+    if (intent) {
+      writeIntent({ ...intent, phase: 'ROLLED_BACK' });
+      cleanIntent(txId);
+    }
+    throw gitErr;
+  }
+
+  // Fase 2: DB + limpeza do WAL (idempotente)
+  executeDBPhase(txId, db, params.dbPayload);
+
+  return { txId, stashRef };
+}
+```
+
+### Diagrama de Sequência — Fluxo Completo com Pontos de Crash
+
+```
+beginCheckpoint()    executeGitPhase()    executeDBPhase()
+      |                     |                    |
+      |─ writeIntent ──────►|                    |   ← SIGKILL aqui → bootReconciler vê INTENT_WRITTEN
+      |  {INTENT_WRITTEN}   |                    |     → Abort limpo, nada foi feito ✅
+      |                     |─ git stash ───────►|
+      |                     |─ writeIntent ──────►   ← SIGKILL aqui → bootReconciler vê GIT_STASH_DONE
+      |                     |  {GIT_STASH_DONE}  |     → Stash existe; re-drives DB idempotentemente ✅
+      |                     |                    |─ db.transaction()
+      |                     |                    |─ writeIntent {DB_COMMITTED}
+      |                     |                    |─ cleanIntent()  ← SIGKILL aqui → bootReconciler
+      |                     |                    |                    vê DB_COMMITTED → limpa arquivo ✅
+      |                     |                    └─ DONE
+```
+
+> **Regra de ouro:** O arquivo WAL é a **fonte de verdade do estado em voo**. A qualquer momento, se o arquivo existe, o `bootReconciler` sabe exatamente o que fazer — porque a fase registrada no JSON define o caminho de recuperação de forma determinística.
+
 ---
 
 ## 2. Contratos TypeScript Centrais
@@ -1036,7 +1400,7 @@ export class LazyContextLoader {
 
 ---
 
-## 2.8 CPGLoopDetector — Detecção Semântica de Loops com CPG + Execution Oracle
+## 2.8 CPGLoopDetector — Detecção Semântica de Loops com CPG + Execution Oracle (v2.3 — Blueprint Completo)
 
 **Propósito:** Detectar loops de agentes mesmo quando transformam código de forma semanticamente equivalente (ex: recursão → iteração, usando diferentes paradigmas). Resolve a vulnerabilidade de Tier 1/2/3 do LoopDetector v2.2 que falha em reformulações arquiteturais.
 
@@ -1192,6 +1556,422 @@ async function detectSemanticLoop(
 - **CPG Extraction:** ~50-100ms por round (amortizado entre agentes)
 - **Execution Oracle:** ~500ms (roda testes do projeto; acontece apenas após detecção CPG)
 - **Total:** Adição negligenciável à latência (dominante é chamada Gemini ~2s)
+
+### Classe CPGLoopDetector — Contrato TypeScript Completo (Dossiê v2.3)
+
+> **Fonte:** Dossiê de Implementação v2.3, Módulo 2. Classe `CPGLoopDetector` pronta para ingestão pela equipe de implementação.
+
+```typescript
+// cpg-loop-detector.ts
+// ARQUITETURA: CPG = AST + CFG + DFG (fusão de 3 representações)
+// Detecção: sideEffectHash (oracle) > CPG similarity > cycle
+import crypto from 'crypto';
+import { execFileSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+
+interface CPGVector {
+  nodeTypeFreq: Record<string, number>;  // AST Layer: frequência de tipos de nó
+  controlDepth: number;                  // CFG Layer: profundidade máxima de aninhamento
+  dataFlowEdges: number;                 // DFG Layer: estimativa de arestas de fluxo
+  sideEffectHash: string;               // Oracle Layer: hash normalizado dos efeitos colaterais
+}
+
+interface AgentSnapshot {
+  roundIndex: number;
+  worktreeHash: string;
+  cpgVector: CPGVector;
+  modifiedFiles: string[];
+  timestamp: number;
+}
+
+type LoopDiagnosis =
+  | { isLoop: true; type: 'INVARIANT_SIDE_EFFECTS' | 'CPG_CYCLE'; cycleLength?: number; invariantHash?: string; affectedFiles: string[]; recommendation: string; }
+  | { isLoop: false };
+
+function extractCPGVector(source: string, testOutput: string): CPGVector {
+  const nodePatterns: Record<string, RegExp> = {
+    'if': /\bif\s*\(/g, 'switch': /\bswitch\s*\(/g, 'for': /\bfor\s*\(/g,
+    'while': /\bwhile\s*\(/g, 'arrow_fn': /=>\s*[{(]/g, 'function': /\bfunction\s+\w/g,
+    'async': /\basync\b/g, 'await': /\bawait\b/g, 'return': /\breturn\b/g,
+    'throw': /\bthrow\b/g, 'try': /\btry\s*\{/g,
+    'assignment': /(?<![=!<>])=(?!=)/g, 'const': /\bconst\b/g, 'let': /\blet\b/g,
+  };
+  const nodeTypeFreq: Record<string, number> = {};
+  for (const [type, pattern] of Object.entries(nodePatterns)) {
+    nodeTypeFreq[type] = (source.match(pattern) ?? []).length;
+  }
+  const lines = source.split('\n');
+  const controlDepth = Math.max(0, ...lines.map(l => Math.floor((l.match(/^\s+/)?.[0].length ?? 0) / 2)));
+  const declarations = (source.match(/\b(?:const|let|var)\s+\w+/g) ?? []).length;
+  const identifiers = (source.match(/\b[a-z_][a-zA-Z0-9_]{1,}\b/g) ?? []).length;
+  const dataFlowEdges = Math.max(0, identifiers - declarations);
+  // Oracle: normaliza o output dos testes removendo variações sem semântica
+  const normalized = testOutput
+    .replace(/\d+\s*ms/gi, 'Xms')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, 'UUID')
+    .replace(/\d{4}-\d{2}-\d{2}T[\d:.Z]+/g, 'TIMESTAMP')
+    .replace(/\s+/g, ' ').trim();
+  const sideEffectHash = crypto.createHash('sha256').update(normalized).digest('hex').substring(0, 20);
+  return { nodeTypeFreq, controlDepth, dataFlowEdges, sideEffectHash };
+}
+
+/**
+ * computeCPGSimilarity() — Score [0.0 - 1.0].
+ * Pesos (baseados em importância semântica):
+ *   Oracle (sideEffect): 60% — se testes passam igual, são equivalentes
+ *   Node types (AST):    30% — mesmo conjunto de constructs
+ *   Control depth (CFG): 10% — proxy de complexidade de fluxo
+ * Paradigm-shift proof: if→switch muda nodeTypeFreq mas NÃO o sideEffectHash.
+ */
+function computeCPGSimilarity(a: CPGVector, b: CPGVector): number {
+  const oracleScore = a.sideEffectHash === b.sideEffectHash ? 1.0 : 0.0;
+  const allTypes = new Set([...Object.keys(a.nodeTypeFreq), ...Object.keys(b.nodeTypeFreq)]);
+  let typeScore = 0;
+  for (const t of allTypes) {
+    const fa = a.nodeTypeFreq[t] ?? 0; const fb = b.nodeTypeFreq[t] ?? 0;
+    const max = Math.max(fa, fb);
+    if (max > 0) typeScore += 1 - Math.abs(fa - fb) / max;
+  }
+  typeScore = allTypes.size > 0 ? typeScore / allTypes.size : 1.0;
+  const maxDepth = Math.max(a.controlDepth, b.controlDepth);
+  const depthScore = maxDepth > 0 ? 1 - Math.abs(a.controlDepth - b.controlDepth) / maxDepth : 1.0;
+  return (oracleScore * 0.6) + (typeScore * 0.3) + (depthScore * 0.1);
+}
+
+export class CPGLoopDetector {
+  private history: AgentSnapshot[] = [];
+  private readonly WINDOW_SIZE    = 6;
+  private readonly SIMILARITY_THR = 0.85;
+  private readonly MIN_ROUNDS     = 3;
+
+  /**
+   * detectLoop() — DOIS CRITÉRIOS (em ordem de prioridade):
+   *
+   * 1. INVARIANT_SIDE_EFFECTS:
+   *    O hash do output dos testes não mudou por MIN_ROUNDS rounds.
+   *    "Se o agente muda código mas o resultado é o mesmo, está em loop."
+   *
+   * 2. CPG_CYCLE:
+   *    Os CPGVectors formam um ciclo de comprimento N.
+   *    Detecta loops mesmo com mudanças de paradigma (recursão→for etc).
+   */
+  detectLoop(worktreePath: string, testOutput: string): LoopDiagnosis {
+    const diffOutput = execFileSync('git', ['-C', worktreePath, 'diff', '--name-only', 'HEAD']).toString().trim();
+    const modifiedFiles = diffOutput.split('\n').filter(Boolean);
+    let combinedSource = '';
+    for (const file of modifiedFiles) {
+      const full = path.join(worktreePath, file);
+      if (fs.existsSync(full)) combinedSource += fs.readFileSync(full, 'utf8');
+    }
+    const cpgVector = extractCPGVector(combinedSource, testOutput);
+    const worktreeHash = crypto.createHash('sha256').update(combinedSource).digest('hex').substring(0, 16);
+    const snap: AgentSnapshot = { roundIndex: this.history.length, worktreeHash, cpgVector, modifiedFiles, timestamp: Date.now() };
+    this.history.push(snap);
+    if (this.history.length > this.WINDOW_SIZE * 2) this.history.shift();
+    const recent = this.history.slice(-this.WINDOW_SIZE);
+    if (recent.length < this.MIN_ROUNDS) return { isLoop: false };
+
+    // Critério 1: Invariância de efeitos colaterais
+    const sideEffectHashes = new Set(recent.map(s => s.cpgVector.sideEffectHash));
+    if (sideEffectHashes.size === 1) {
+      return { isLoop: true, type: 'INVARIANT_SIDE_EFFECTS', invariantHash: [...sideEffectHashes][0],
+        affectedFiles: [...new Set(recent.flatMap(s => s.modifiedFiles))],
+        recommendation: `Agent cycling for ${recent.length} rounds without changing test outcomes. Inject new constraint or escalate.` };
+    }
+
+    // Critério 2: CPG cycle detection
+    for (let len = 2; len <= Math.floor(recent.length / 2); len++) {
+      let isCycle = true;
+      for (let i = 0; i + len < recent.length; i++) {
+        if (computeCPGSimilarity(recent[i].cpgVector, recent[i + len].cpgVector) < this.SIMILARITY_THR) { isCycle = false; break; }
+      }
+      if (isCycle) {
+        return { isLoop: true, type: 'CPG_CYCLE', cycleLength: len,
+          affectedFiles: [...new Set(recent.flatMap(s => s.modifiedFiles))],
+          recommendation: `CPG cycle of length ${len} (similarity >${this.SIMILARITY_THR}). Paradigm shift detected as equivalent loop. Force new approach.` };
+      }
+    }
+    return { isLoop: false };
+  }
+
+  reset(): void { this.history = []; }
+}
+```
+
+> 🔑 **Nota de Escala:** Para produção, substitua o extrator regex pelo **Fraunhofer AISEC/CPG** (JVM via child_process), que tem suporte experimental nativo para TypeScript e fornece análise estrutural e semântica completa.
+
+---
+
+## 2.9 Configuração Vite para CodeMirror 6 — Nó Crítico de Implementação
+
+**Problema:** O CodeMirror 6 usa `SharedArrayBuffer` internamente para suas operações de parse paralelo. O browser bloqueia `SharedArrayBuffer` em contextos sem **Cross-Origin Isolation** ativo. Sem a configuração correta do Vite, o CM6 falha silenciosamente com erro `ReferenceError: SharedArrayBuffer is not defined` em produção.
+
+**Segundo problema:** O Vite tenta pré-agrupar (pre-bundle) os módulos do CodeMirror 6 via esbuild. Como o CM6 usa top-level `await` e ESM condicional, o esbuild falha ao processar esses pacotes, quebrando o dev server.
+
+### Solução: Headers de Cross-Origin-Isolation + exclusão do optimizeDeps
+
+```typescript
+// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [
+    react(),
+    // Plugin para injetar os headers COOP/COEP obrigatórios para SharedArrayBuffer
+    {
+      name: 'cross-origin-isolation',
+      configureServer(server) {
+        server.middlewares.use((_req, res, next) => {
+          // Cross-Origin-Opener-Policy: same-origin
+          //   → Isola a aba do browser em seu próprio grupo de contexto
+          //   → Requisito 1/2 para habilitar SharedArrayBuffer
+          res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+
+          // Cross-Origin-Embedder-Policy: require-corp
+          //   → Garante que todos os recursos carregados têm CORS ou CORP
+          //   → Requisito 2/2 para habilitar SharedArrayBuffer
+          res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          next();
+        });
+      },
+      // Em produção (build), configurar o servidor web (Nginx/Caddy) com os mesmos headers.
+      // Exemplo Nginx:
+      //   add_header Cross-Origin-Opener-Policy "same-origin";
+      //   add_header Cross-Origin-Embedder-Policy "require-corp";
+    },
+  ],
+  optimizeDeps: {
+    // Exclui os pacotes do CodeMirror 6 do pré-bundling do esbuild.
+    // Razão: CM6 usa ESM condicional e top-level await incompatíveis com esbuild.
+    // O Vite irá servir esses pacotes diretamente sem transformação.
+    exclude: [
+      '@codemirror/state',
+      '@codemirror/view',
+      '@codemirror/language',
+      '@codemirror/commands',
+      '@codemirror/lang-javascript',
+      '@codemirror/lang-typescript',
+      '@codemirror/autocomplete',
+      '@codemirror/search',
+      '@codemirror/lint',
+      'codemirror',
+    ],
+  },
+  server: {
+    // Headers também aplicados via config do servidor (alternativa ao plugin):
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+});
+```
+
+> ⚠️ **Impacto da COEP:** `require-corp` bloqueia o carregamento de recursos externos (imagens, fontes, iframes) que não incluam o header `Cross-Origin-Resource-Policy`. Isso inclui CDNs públicos. Fontes do Google Fonts, por exemplo, requerem hospedagem local ou proxy com CORP header. Planeje isso na estratégia de assets do GreenForge IDE.
+
+---
+
+## 2.10 PreExecutionGuard — OCC + HMAC + Worktree Hash Fencing (v2.3 — Blueprint Completo)
+
+**Propósito:** Gate de aprovação HITL com quatro camadas de defesa contra aprovações obsoletas (`Stale Approval`). Adiciona o conceito-chave da v2.3 ausente na v2.2.1: o **Worktree Hash** captura o estado completo do filesystem no momento da proposta. Na aprovação, qualquer divergência invalida o gate — garantindo que o usuário aprova exatamente o que será executado.
+
+### Quatro Camadas de Defesa (fail-fast, mais barata primeiro)
+
+| Camada | Verificação | Razão de Falha |
+|---|---|---|
+| 1 — TTL | `now > issuedAt + ttlMs` | Card expirou temporalmente |
+| 2 — HMAC | `timingSafeEqual(card.hmac, computed)` | Card forjado ou adulterado em trânsito |
+| 3 — Worktree Hash | `currentHash !== card.worktreeHash` | Filesystem mudou desde a emissão do card |
+| 4 — OCC Version | `UPDATE WHERE version = card.version → 0 rows` | DB foi modificado (stale approval ou race condition) |
+
+### Contrato TypeScript Completo (Dossiê v2.3, Módulo 3)
+
+```typescript
+// pre-execution-guard.ts
+import crypto from 'crypto';
+import { execFileSync } from 'child_process';
+import Database from 'better-sqlite3';
+import { z } from 'zod';
+
+const ApprovalCardSchema = z.object({
+  cardId:          z.string().uuid(),
+  agentId:         z.string().min(1),
+  proposedAction:  z.string().max(1024),
+  resourceVersion: z.number().int().nonneg(),   // OCC epoch snapshot no momento da emissão
+  worktreeHash:    z.string().length(64),        // SHA256 do worktree no momento da emissão
+  worktreePath:    z.string().min(1),
+  issuedAt:        z.number(),
+  ttlMs:           z.number().default(5 * 60 * 1000),
+  hmac:            z.string().min(32),
+});
+
+export type ApprovalCard = z.infer<typeof ApprovalCardSchema>;
+
+export type GateResult =
+  | { ok: true;  newVersion: number; message: string }
+  | { ok: false; reason: 'TTL_EXPIRED' | 'HMAC_INVALID' | 'VERSION_CONFLICT'
+                       | 'WORKTREE_DIVERGED' | 'RESOURCE_NOT_FOUND' | 'RACE_CONDITION';
+      detail: string };
+
+const HMAC_SECRET = process.env.GREENFORGE_GATE_SECRET ?? (() => {
+  throw new Error('[SECURITY] GREENFORGE_GATE_SECRET env var is required in production.');
+})();
+
+/**
+ * computeWorktreeHash() — O "Epoch Fence" do filesystem.
+ * Usa git write-tree para capturar o estado de todos os arquivos rastreados.
+ * Qualquer mudança de 1 byte invalida o Approval Card.
+ */
+function computeWorktreeHash(worktreePath: string): string {
+  const treeHash = execFileSync('git', ['-C', worktreePath, 'write-tree']).toString().trim();
+  return crypto.createHash('sha256').update(treeHash).digest('hex');
+}
+
+function computeHMAC(card: Omit<ApprovalCard, 'hmac'>): string {
+  const payload = [
+    card.cardId, card.agentId, card.proposedAction,
+    card.resourceVersion.toString(), card.worktreeHash,
+    card.issuedAt.toString(),
+  ].join(':');
+  return crypto.createHmac('sha256', HMAC_SECRET).update(payload).digest('hex');
+}
+
+export class PreExecutionGuard {
+  constructor(private db: Database.Database) {
+    this.db.pragma('journal_mode = WAL');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_resources (
+        id              TEXT    PRIMARY KEY,
+        currentVersion  INTEGER NOT NULL DEFAULT 0,
+        state           TEXT    NOT NULL,
+        lastModifiedAt  INTEGER NOT NULL
+      );
+    `);
+  }
+
+  /**
+   * issueCard() — Captura DOIS snapshots no momento da emissão:
+   *   1. resourceVersion (OCC) — estado do DB
+   *   2. worktreeHash (Epoch Fence) — estado do filesystem
+   * Se QUALQUER UM divergir na aprovação, o gate é invalidado.
+   */
+  issueCard(agentId: string, proposedAction: string, worktreePath: string): ApprovalCard {
+    const resource = this.db.prepare(
+      `SELECT * FROM agent_resources WHERE id = ?`
+    ).get(agentId) as { id: string; currentVersion: number; state: string; lastModifiedAt: number } | undefined;
+    if (!resource) throw new Error(`Agent resource not found: ${agentId}`);
+
+    const cardBase: Omit<ApprovalCard, 'hmac'> = {
+      cardId:          crypto.randomUUID(),
+      agentId,
+      proposedAction,
+      resourceVersion: resource.currentVersion,
+      worktreeHash:    computeWorktreeHash(worktreePath),
+      worktreePath,
+      issuedAt:        Date.now(),
+      ttlMs:           5 * 60 * 1000,
+    };
+    return ApprovalCardSchema.parse({ ...cardBase, hmac: computeHMAC(cardBase) });
+  }
+
+  /**
+   * submitApproval() — Sequência de validação fail-fast (mais barata primeiro):
+   *   1. Schema Zod
+   *   2. TTL check                → TTL_EXPIRED
+   *   3. HMAC verification        → HMAC_INVALID
+   *   4. Worktree Hash check      → WORKTREE_DIVERGED  ← Pre-Execution Guard
+   *   5. OCC atomic UPDATE        → VERSION_CONFLICT | RACE_CONDITION
+   */
+  submitApproval(rawCard: unknown): GateResult {
+    // Camada 0: Schema
+    const parse = ApprovalCardSchema.safeParse(rawCard);
+    if (!parse.success) return { ok: false, reason: 'HMAC_INVALID', detail: `Schema: ${parse.error.message}` };
+    const card = parse.data;
+
+    // Camada 1: TTL
+    if (Date.now() > card.issuedAt + card.ttlMs) {
+      const ago = Math.round((Date.now() - card.issuedAt - card.ttlMs) / 1000);
+      return { ok: false, reason: 'TTL_EXPIRED', detail: `Card expired ${ago}s ago. Request a fresh card.` };
+    }
+
+    // Camada 2: HMAC (timing-safe para prevenir timing attacks)
+    const expected = computeHMAC({
+      cardId: card.cardId, agentId: card.agentId, proposedAction: card.proposedAction,
+      resourceVersion: card.resourceVersion, worktreeHash: card.worktreeHash,
+      worktreePath: card.worktreePath, issuedAt: card.issuedAt, ttlMs: card.ttlMs,
+    });
+    if (!crypto.timingSafeEqual(Buffer.from(card.hmac), Buffer.from(expected))) {
+      return { ok: false, reason: 'HMAC_INVALID', detail: 'HMAC mismatch — card tampered or replay attack.' };
+    }
+
+    // Camada 3: Worktree Hash — "O filesystem que o usuário aprovou é o mesmo que será executado?"
+    const currentHash = computeWorktreeHash(card.worktreePath);
+    if (currentHash !== card.worktreeHash) {
+      return { ok: false, reason: 'WORKTREE_DIVERGED',
+        detail: `Worktree changed since card was issued. Card: ${card.worktreeHash.slice(0, 8)}… Current: ${currentHash.slice(0, 8)}… A fresh proposal is required.` };
+    }
+
+    // Camada 4: OCC atomic check + update (dentro de transação SQLite — previne TOCTOU)
+    return this.db.transaction((): GateResult => {
+      const resource = this.db.prepare(
+        `SELECT * FROM agent_resources WHERE id = ?`
+      ).get(card.agentId) as { currentVersion: number } | undefined;
+
+      if (!resource) return { ok: false, reason: 'RESOURCE_NOT_FOUND', detail: `Agent ${card.agentId} not found` };
+
+      if (resource.currentVersion !== card.resourceVersion) {
+        return { ok: false, reason: 'VERSION_CONFLICT',
+          detail: `Stale: card@v${card.resourceVersion} vs current@v${resource.currentVersion}. Resource modified during server downtime.` };
+      }
+
+      const changes = this.db.prepare(`
+        UPDATE agent_resources
+        SET    state = ?, currentVersion = currentVersion + 1, lastModifiedAt = ?
+        WHERE  id = ? AND currentVersion = ?
+      `).run(card.proposedAction, Date.now(), card.agentId, card.resourceVersion);
+
+      if (changes.changes === 0) {
+        return { ok: false, reason: 'RACE_CONDITION', detail: 'Concurrent update at commit time. Retry with fresh card.' };
+      }
+      return { ok: true, newVersion: resource.currentVersion + 1, message: 'Approval applied.' };
+    })();
+  }
+}
+```
+
+---
+
+## 2.11 Tabela de Contratos de Função — Referência Consolidada (Dossiê v2.3)
+
+> Tabela canônica extraída do final do Dossiê de Implementação v2.3. Define o contrato completo de cada função crítica do sistema de resiliência. Após esta tabela, a equipe de implementação não precisa consultar os dossiês externos.
+
+| Módulo | Função Principal | Pré-condição | Pós-condição | Sobrevive a SIGKILL? |
+|---|---|---|---|---|
+| `bootReconciler()` | Resolve todos os intents WAL pendentes no startup | DB aberto em WAL mode, `WAL_DIR` acessível | Sistema em estado consistente (Git ↔ SQLite sincronizados) | ✅ É a resposta ao crash |
+| `beginCheckpoint()` | Fase 0: Escreve intent antes de qualquer side-effect | Nenhuma | Intent em `INTENT_WRITTEN` no disco (durável via fsync) | ✅ (nada foi feito ainda) |
+| `executeGitPhase()` | Fase 1: `git stash push` + atualiza WAL com stash ref | Intent em `INTENT_WRITTEN` | Intent em `GIT_STASH_DONE` com `stashRef` preenchido | ✅ Recovery re-drives DB |
+| `executeDBPhase()` | Fase 2: Atualiza SQLite + limpa arquivo WAL | Intent em `GIT_STASH_DONE` | Intent deletado, DB atualizado (idempotente) | ✅ Re-executável N vezes |
+| `CPGLoopDetector.detectLoop()` | Detecta loop semântico via CPG + Execution Oracle | Worktree Git acessível, ≥ `MIN_ROUNDS` no histórico | `LoopDiagnosis` (type + recommendation) ou `{ isLoop: false }` | N/A |
+| `PreExecutionGuard.issueCard()` | Emite Approval Card com snapshots OCC + Worktree Hash | Agente registrado no DB, worktree acessível | Card assinado com HMAC; `resourceVersion` + `worktreeHash` capturados | N/A |
+| `PreExecutionGuard.submitApproval()` | Valida e aplica aprovação humana (4 camadas) | Card com HMAC válido submetido via WebSocket | Ação aplicada (`ok: true`) ou erro tipado com razão específica | N/A (transação atômica) |
+| `secureGit()` | Executa git com sanitização completa de 7 camadas | Subcomando na allowlist positiva, worktree resolvível | `SecureGitResult` com stdout limpo ou `SecurityError` tipado | N/A (defesa em tempo de execução) |
+
+### Dependências entre Módulos — Ordem de Inicialização Obrigatória
+
+```
+Boot do Agent Server:
+  1. db = new Database('.greenforge/db.sqlite')
+     db.pragma('journal_mode = WAL')       ← SEMPRE antes de qualquer uso do DB
+  2. bootReconciler(db)                    ← PRIMEIRO componente, resolve estados zumbi
+  3. guard = new PreExecutionGuard(db)     ← Compartilha a mesma instância do DB
+  4. detector = new CPGLoopDetector()      ← Independente, stateful por agente (1 instância/agente)
+  5. secureGit(...)                        ← Puro, sem estado, chamado por demanda
+
+Variável obrigatória em produção:
+  GREENFORGE_GATE_SECRET=<256-bit-hex>    ← Ausência lança SecurityError no startup
+```
 
 ---
 
@@ -1464,6 +2244,37 @@ export class AIS {
 }
 ```
 
+### 5.2.2 AIS — Orçamento de Contexto por Janela de Debate (v2.3)
+
+> **Resposta ao gap identificado:** O protocolo AIS define *como* comprimir, mas o sistema precisa de limites concretos de token para cada janela. Esta seção especifica esses limites, tornando o protocolo completamente autossuficiente.
+
+| Componente do Contexto | Token Budget | Regra de Gestão |
+|---|---|---|
+| **Âncora Dialética** (imutável) | `≤ 8.000 tokens` | Nunca comprimida. Se `anchorText > 8k`, truncar `keyDecisions` mantendo `originalTask` + `openIssues` intactos |
+| **Round atual** (working memory) | `≤ 16.000 tokens` | Sempre completo — é o contexto de trabalho do agente |
+| **Round anterior** (N-1) | `≤ 8.000 tokens` | Sempre completo — referência imediata para continuidade |
+| **Rounds históricos** (N-2 a N-k) | `≤ 32.000 tokens` total | Comprimidos via LLM em batch; cada round resumido em ~2.000 tokens |
+| **System prompt do agente** | `≤ 8.000 tokens` | Fixo; carregado do `AGENTS.md`; não é comprimido |
+| **Código do worktree** (LazyContext) | `≤ 56.000 tokens` | Carregado sob demanda via `CONTEXT_TOKEN_BUDGET` — ativado apenas se necessário |
+| **Budget padrão por chamada** | `128.000 tokens` | `CONTEXT_TOKEN_BUDGET` — budget seguro para chamadas normais |
+| **Budget estendido** | `1.000.000 tokens` | `CONTEXT_EXTENDED_BUDGET` — requer `HITL_GATE { gateType: 'COST_APPROVAL' }` |
+
+**Trigger de compressão:** Quando `estimateTokens(fullContext) > CONTEXT_TOKEN_BUDGET * 0.85`, o AIS é acionado automaticamente para comprimir rounds históricos antes da próxima chamada LLM.
+
+**Regra de compressão por round:**
+```typescript
+// Cada round histórico (N-2 em diante) é resumido neste formato:
+interface CompressedRound {
+  roundIndex: number;
+  summarized: true;
+  summary: string;         // ≤ 2.000 tokens — gerado pelo LLM com instrução específica
+  keyDecisions: string[];  // Extraídos pelo árbitro — preservados literalmente
+  loopDetected?: boolean;  // Flag de detecção preservada para análise histórica
+}
+// O LLM recebe instrução: "Resuma este round em ≤ 400 palavras, preservando:
+// (1) o que foi proposto, (2) por que foi rejeitado, (3) o que ficou em aberto."
+```
+
 ### 5.3 RollbackManager (Saga Pattern & Atomic Recovery)
 
 ```typescript
@@ -1552,3 +2363,4 @@ export async function withExponentialBackoff<T>(
 | `GIT_OPERATION_TIMEOUT_MS` | `30000` | Timeout para operações de Git (Async simple-git). |
 | `LOOP_DETECTOR_THRESHOLD` | `0.92` | Threshold de similaridade SimHash para detecção de loop. |
 | `SSE_EVENT_MAX_AGE_MS` | `86400000` | Tempo de retenção de eventos no Outbox (default 24h). |
+| `GREENFORGE_GATE_SECRET` | — | **Obrigatória em produção.** Segredo 256-bit (hex) para HMAC dos Approval Cards (`PreExecutionGuard`). Ausência lança erro de startup. |

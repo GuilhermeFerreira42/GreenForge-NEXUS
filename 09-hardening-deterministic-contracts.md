@@ -1,9 +1,10 @@
-# 09 — CONTRATOS DETERMINÍSTICOS DE ENGENHARIA — GreenForge NEXUS v2.2
+# 09 — CONTRATOS DETERMINÍSTICOS DE ENGENHARIA — GreenForge NEXUS v2.3
 
-> **Status:** ✅ | **Versão:** 2.2 | **Data:** 2026-05-14
+> **Status:** ✅ | **Versão:** 2.3 | **Data:** 2026-05-15
 > **Propósito:** Eliminar toda ambiguidade de implementação remanescente.
 > Cada seção responde à pergunta: **"O que acontece exatamente se X falhar neste ponto?"**
 > Um engenheiro deve conseguir implementar qualquer componente abaixo sem fazer perguntas.
+> **v2.3 adiciona:** §6 CPGLoopDetector (imunidade semântica) + §7 PreExecutionGuard (OCC + Epoch Fence)
 
 ---
 
@@ -472,15 +473,178 @@ SSE_EVENT_BUFFER_OVERFLOW (> 200 eventos em 1 frame):
 
 ---
 
+## 6. CPGLoopDetector v2.3 — CONTRATO DE IMUNIDADE SEMÂNTICA
+
+> **Problema que resolve:** O LoopDetector v2.2 (§1) usa AST fingerprinting + SimHash. Falha quando o agente muda paradigma mas mantém semântica (recursão→for→while→reduce). A v2.3 adiciona o **Execution Oracle** como camada primária.
+
+### 6.1 Diagrama de Decisão — O Que Exatamente É um Loop?
+
+```
+Round N começa:
+  1. git diff --name-only HEAD → lista de arquivos modificados
+  2. Concatena conteúdo de todos os arquivos modificados → combinedSource
+  3. Extrai CPGVector(combinedSource, testOutput):
+     a. nodeTypeFreq: frequência de 13 tipos de nó AST (if, for, while, async, etc.)
+     b. controlDepth: profundidade máxima de aninhamento de controle
+     c. dataFlowEdges: (total de identificadores) - (total de declarações)
+     d. sideEffectHash: SHA256(normalizeTestOutput(testOutput)).slice(0,20)
+        onde normalizeTestOutput remove: timings (Xms), UUIDs, timestamps ISO
+  4. Calcula worktreeHash = SHA256(combinedSource).slice(0,16)
+  5. Appenda AgentSnapshot à history (máx. 12 = 2 × WINDOW_SIZE)
+
+Se history.length < MIN_ROUNDS=3: return { isLoop: false }  // janela insuficiente
+
+Pega recent = history.slice(-WINDOW_SIZE=6)
+
+Critério 1 — INVARIANT_SIDE_EFFECTS (prioridade alta):
+  Se todos os sideEffectHash em recent são iguais:
+    → isLoop: true, type: 'INVARIANT_SIDE_EFFECTS'
+    → O agente mudou código por N rounds mas testes passam/falham igual
+    → Recomendação: injetar nova constraint ou mudar objetivo
+
+Critério 2 — CPG_CYCLE (prioridade menor):
+  Para len em [2, 3] (floor(6/2)=3):
+    Para cada par (recent[i], recent[i+len]):
+      similarity = computeCPGSimilarity(a, b)
+                 = (oracle_score * 0.6) + (type_score * 0.3) + (depth_score * 0.1)
+    Se todos os pares têm similarity >= SIMILARITY_THR=0.85:
+      → isLoop: true, type: 'CPG_CYCLE', cycleLength: len
+      → Ciclo de período len detectado — paradigm shift equivalente
+
+Retorno: { isLoop: false } se nenhum critério ativo
+```
+
+### 6.2 Contratos por Cenário de Falha
+
+| Cenário | Estado Detectado | Ação Obrigatória |
+|---|---|---|
+| Agente alterna recursão↔for por 6 rounds | `CPG_CYCLE { cycleLength: 2 }` | Parar agente, emitir `HITL_GATE { gateType: 'LOOP_DEADLOCK' }` |
+| Agente muda nomes de vars + refatora mas testes não mudam | `INVARIANT_SIDE_EFFECTS { invariantHash: 'abc...' }` | Injetar nova constraint, resetar histórico do detector |
+| Agente cria classe nova + muda paradigma completamente | `{ isLoop: false }` (sideEffectHash mudou) | Loop legítimo de progresso — continuar |
+| Menos de 3 rounds executados | `{ isLoop: false }` (janela insuficiente) | Nunca detectar em janela insuficiente — evitar falso positivo |
+| `git diff` vazio (agente não mudou nada) | `combinedSource = ''` → `sideEffectHash` é invariante | Detectado como `INVARIANT_SIDE_EFFECTS` na 4ª rodada |
+
+### 6.3 Contrato de Instanciação
+
+```typescript
+// UMA instância por agentId — NUNCA compartilhar entre agentes
+const detectors = new Map<string, CPGLoopDetector>();
+
+function getOrCreateDetector(agentId: string): CPGLoopDetector {
+  if (!detectors.has(agentId)) detectors.set(agentId, new CPGLoopDetector());
+  return detectors.get(agentId)!;
+}
+
+// Ciclo de vida obrigatório:
+// - Criar no início da sessão de debate
+// - detector.reset() quando árbitro injeta nova instrução (STEER)
+// - Destruir (deletar do Map) quando sessão FINALIZADA ou ABORTADA
+```
+
+### 6.4 Escalonamento — O Que Fazer com um LoopDiagnosis Positivo
+
+```
+1. CPGLoopDetector.detectLoop() → { isLoop: true, type, recommendation }
+2. DebateOrchestrator.pauseAgent(agentId)
+3. Se roundIndex < maxRounds:
+   → Árbitro recebe: { round, loopDiagnosis, affectedFiles }
+   → Árbitro pode emitir STEER com nova instrução
+   → Se STEER: detector.reset() e continuar
+4. Se roundIndex === maxRounds OU árbitro não consegue STEER:
+   → Emitir HITL_GATE { gateType: 'LOOP_DEADLOCK', loopDiagnosis }
+   → Persistir no DebateRound.loopDetected = true, .loopType, .loopCycleLength
+   → Aguardar decisão humana
+```
+
+---
+
+## 7. PreExecutionGuard v2.3 — CONTRATO DE EPOCH FENCE
+
+> **Problema que resolve:** Na v2.2.1, a aprovação HITL usava apenas `resourceVersion` (OCC). Se o servidor reiniciava entre `issueCard()` e `submitApproval()`, o `resourceVersion` era resetado para 0 — o gate aprovava uma versão diferente do worktree que o usuário viu.
+> **v2.3 adiciona:** `worktreeHash` via `git write-tree`, capturando o estado do filesystem. Qualquer mudança de 1 byte → `WORKTREE_DIVERGED`.
+
+### 7.1 Diagrama de Sequência — Fluxo Completo de Aprovação
+
+```
+[Agente]         [PreExecutionGuard]    [SQLite]         [Git Worktree]
+   |                    |                  |                    |
+   |-- issueCard() ---->|                  |                    |
+   |                    |-- SELECT WHERE id=agentId -->|        |
+   |                    |<-- { currentVersion: 5 } ----|        |
+   |                    |-- git write-tree ------------>|--------|
+   |                    |<-- treeHash ------------------|        |
+   |                    | (worktreeHash = SHA256(treeHash))      |
+   |                    | (hmac = HMAC(secret, payload))         |
+   |<-- ApprovalCard ---|                  |                    |
+   |
+   | [Card enviado ao usuário via SSE — usuário revisa]
+   |
+[Usuário]       [PreExecutionGuard]    [SQLite]         [Git Worktree]
+   |                    |                  |                    |
+   |-- submitApproval(card) -->|           |                    |
+   |                    | Zod schema ✓     |                    |
+   |                    | TTL check ✓      |                    |
+   |                    | HMAC verify ✓    |                    |
+   |                    |-- git write-tree ------------>|--------|
+   |                    |<-- currentHash ---|            |       |
+   |                    | currentHash === card.worktreeHash?     |
+   |                    |   SE NÃO → WORKTREE_DIVERGED           |
+   |                    |-- BEGIN TRANSACTION -->|               |
+   |                    |-- SELECT WHERE id=agentId -->|         |
+   |                    |   currentVersion === card.resourceVersion?
+   |                    |   SE NÃO → VERSION_CONFLICT            |
+   |                    |-- UPDATE SET version+1 WHERE version=N→|
+   |                    |   changes === 0? → RACE_CONDITION       |
+   |                    |-- COMMIT -------->|                    |
+   |<-- { ok: true } ---|                  |                    |
+```
+
+### 7.2 Contratos por Cenário de Falha
+
+| Cenário | GateResult | Mensagem ao usuário |
+|---|---|---|
+| Card emitido, SIGKILL, servidor reinicia, worktree limpo, versão resetada | `VERSION_CONFLICT` | "Card emitido para v5; servidor reiniciou, DB está em v0. Solicite novo card." |
+| Outro agente commita no worktree enquanto usuário revisa | `WORKTREE_DIVERGED` | "Worktree mudou. Card: abc12345. Atual: def67890. Solicite novo card." |
+| Usuário tenta aprovar card com > 5 min de idade | `TTL_EXPIRED` | "Card expirou há 47s. Solicite novo card." |
+| Atacante forja um card sem conhecer o GREENFORGE_GATE_SECRET | `HMAC_INVALID` | "HMAC inválido — card adulterado." |
+| Dois usuários aprovam simultaneamente (race condition no UPDATE) | `RACE_CONDITION` para o segundo | "Atualização concorrente. Retry com novo card." |
+
+### 7.3 Contrato de Segurança — O Que `computeWorktreeHash()` Cobre
+
+```
+git write-tree captura:
+  ✓ Conteúdo de todos os arquivos rastreados (tracked)
+  ✓ Permissões de arquivo
+  ✓ Estrutura de diretórios
+
+git write-tree NÃO captura:
+  ✗ Arquivos não rastreados (untracked) — não estão no index
+  ✗ Arquivos em .gitignore
+
+Consequência: Um agente que escreve payload malicioso em arquivo .gitignored
+não é detectado pelo worktreeHash. Mitigação: o agente já não tem permissão
+de escrever fora do worktreePath (AUTHORIZED_WORKTREES_ROOT + realpath()).
+```
+
+---
+
 ## CHECKLIST DE IMPLEMENTAÇÃO — CRITÉRIO DE ACEITE
 
 Um engenheiro que implementou o sistema corretamente deve conseguir responder SIM a todas as perguntas abaixo:
 
-### LoopDetector
+### LoopDetector v2.2 (AST)
 - [ ] O hash AST ignora nomes de variáveis e strings literais?
 - [ ] Um agente que muda apenas `const x` para `const y` é detectado como loop?
 - [ ] O sinal de loop é escalado após **2 repetições consecutivas** (AST/SHA-256) ou **3** (SimHash)?
 - [ ] O LoopSignal é persistido no `DebateRound` do DB?
+
+### CPGLoopDetector v2.3 (Semantic)
+- [ ] Um agente que muda recursão para `for` por 6 rounds tem `CPG_CYCLE { cycleLength: 2 }` detectado?
+- [ ] Um agente que muda nomes de vars sem mudar saída de testes tem `INVARIANT_SIDE_EFFECTS` na 4ª rodada?
+- [ ] `detectLoop()` retorna `{ isLoop: false }` para os 2 primeiros rounds (janela insuficiente)?
+- [ ] `detector.reset()` é chamado quando o árbitro injeta nova instrução (STEER)?
+- [ ] Cada `agentId` tem sua própria instância de `CPGLoopDetector` (não compartilhada)?
+- [ ] `LoopDiagnosis` positivo é persistido em `DebateRound.loopDetected`, `.loopType`, `.loopCycleLength`?
 
 ### Gate Hydration
 - [ ] O payload do `OutboxEvent` para `HITL_GATE` é autossuficiente (sem joins necessários)?
@@ -488,11 +652,19 @@ Um engenheiro que implementou o sistema corretamente deve conseguir responder SI
 - [ ] Um cliente que reconecta e tenta aprovar um gate já aprovado recebe 200 OK sem duplicação?
 - [ ] O evento `EPOCH_CHANGE` é emitido imediatamente após reconexão com epoch diferente?
 
+### PreExecutionGuard v2.3
+- [ ] `issueCard()` captura `worktreeHash` via `git write-tree` (não apenas hash do conteúdo)?
+- [ ] Um card emitido antes de um commit no worktree retorna `WORKTREE_DIVERGED` na aprovação?
+- [ ] Um card com HMAC adulterado retorna `HMAC_INVALID` com `crypto.timingSafeEqual()`?
+- [ ] Um card aprovado 6 minutos após emissão retorna `TTL_EXPIRED`?
+- [ ] A atualização de versão usa `UPDATE WHERE version = card.version` (previne TOCTOU)?
+- [ ] `GREENFORGE_GATE_SECRET` ausente lança erro no startup (não silencia)?
+
 ### Saga / Rollback
-- [ ] O `BootReconciler` é executado ANTES de qualquer porta ser aberta?
-- [ ] Um checkpoint em `VFS_STASH_APPLIED` após crash tem o worktree restaurado no próximo boot?
-- [ ] Um checkpoint em `DB_SUCCESS` verifica a existência do commit git antes de finalizar?
-- [ ] O estado `ROLLED_BACK` no DB sempre corresponde a um worktree limpo no filesystem?
+- [ ] O `BootReconciler` (§3 / `03-technical-spec §1.3`) é executado ANTES de qualquer porta ser aberta?
+- [ ] Um intent em `GIT_STASH_DONE` após crash tem o DB atualizado idempotentemente no próximo boot?
+- [ ] Arquivos `.tmp` residuais em `.greenforge/wal/` são removidos pelo `cleanOrphanedTempFiles()`?
+- [ ] O estado `ROLLED_BACK` no WAL sempre corresponde a um worktree limpo no filesystem?
 
 ### Shell Allowlist
 - [ ] `git push origin main` é rejeitado?
@@ -500,6 +672,7 @@ Um engenheiro que implementou o sistema corretamente deve conseguir responder SI
 - [ ] `git status | cat` é rejeitado (pipe proibido)?
 - [ ] `npm run dev` é aceito mas `npm run deploy` requer HITL Gate?
 - [ ] O PTY nunca herda `NODE_OPTIONS` ou `LD_PRELOAD` do processo pai?
+- [ ] `GIT_EXEC_PATH`, `GIT_PAGER`, `GIT_SSH_COMMAND` são removidos do env antes de cada exec?
 
 ### RAF Buffering
 - [ ] Eventos `HITL_GATE` são processados sincronicamente, fora do RAF buffer?
@@ -507,8 +680,17 @@ Um engenheiro que implementou o sistema corretamente deve conseguir responder SI
 - [ ] Batches de > 200 eventos são divididos em múltiplos frames?
 - [ ] O Reorder Buffer é aplicado ANTES do enfileiramento no RAF buffer?
 
+### CodeMirror 6 / Vite (Nó Crítico)
+- [ ] `vite.config.ts` emite `Cross-Origin-Opener-Policy: same-origin` em dev?
+- [ ] `vite.config.ts` emite `Cross-Origin-Embedder-Policy: require-corp` em dev?
+- [ ] `optimizeDeps.exclude` contém os 10 pacotes `@codemirror/*`?
+- [ ] Servidor Nginx/Caddy em produção tem os mesmos dois headers COOP/COEP?
+- [ ] `crossOriginIsolated === true` no console do browser confirma ativação?
+- [ ] Recursos externos (Google Fonts, CDNs) são servidos localmente ou via proxy com CORP header?
+- [ ] Quando `SharedArrayBuffer` indisponível, editor exibe badge de fallback (não quebra)?
+
 ---
 
 **FIM DO DOCUMENTO — 09-hardening-deterministic-contracts.md**
-> *Este arquivo é o nível mais baixo da especificação do GreenForge NEXUS.*
+> *Este arquivo é o nível mais baixo da especificação do GreenForge NEXUS v2.3.*
 > *Não há "e se" não respondido aqui.*
