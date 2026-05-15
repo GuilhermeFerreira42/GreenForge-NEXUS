@@ -1,9 +1,9 @@
 # GreenForge Agent — 03: Especificação Técnica e Dados
 
-> **Status:** ✅ | **Versão:** 2.2 | **Data:** 2026-05-13  
-> **Referências:** Prisma ORM, Saga Pattern, Outbox Pattern, TS-ESTree, Martin Kleppmann (Fencing Tokens), SimHash (Charikar 2002), AIS Protocol
+> **Status:** ✅ | **Versão:** 2.3 | **Data:** 2026-05-15  
+> **Referências:** Prisma ORM, Saga Pattern, Outbox Pattern, Write-Ahead Log (WAL), Code Property Graph (CPG), Optimistic Concurrency Control (OCC), TS-ESTree, Martin Kleppmann (Fencing Tokens), tree-sitter, SimHash (Charikar 2002), AIS Protocol
 
-### 📋 Changelog v2.1.1 → v2.2
+### 📋 Changelog v2.2 → v2.3 — Hardening via BootReconciler, CPGLoopDetector, PreExecutionGuard
 
 | Vuln | Área | Correção |
 |---|---|---|
@@ -319,6 +319,75 @@ model ResourceLease {
 }
 
 ```
+
+---
+
+## 1.3 BootReconciler — Recuperação Pós-SIGKILL com WAL Intent Log
+
+**Propósito:** Reconciliar estados divergentes entre Git filesystem e SQLite database quando um crash (SIGKILL) ocorre entre operações. Executado obrigatoriamente como primeira função no startup do Agent Server.
+
+### Máquina de Estados do Intent Log
+
+Cada transação em voo é representada por um arquivo JSON no `.greenforge/wal/{txId}.json` que persiste a **intenção da operação** antes de qualquer side-effect.
+
+```typescript
+type IntentPhase =
+  | 'INTENT_WRITTEN'   // Fase 0: Log persistido, NADA executado → estado SEGURO para abort
+  | 'GIT_STASH_DONE'  // Fase 1: git stash push concluído, DB NUNCA foi atualizado → requer forward recovery
+  | 'DB_COMMITTED'     // Fase 2: DB update concluído → TUDO OK (arquivo WAL residual apenas)
+  | 'ROLLED_BACK';     // Estado terminal: abort confirmado
+
+interface CheckpointIntent {
+  txId: string;                                          // UUID único da transação
+  agentId: string;                                       // ID do agente responsável
+  worktreePath: string;                                  // Path absoluto do worktree
+  stashMessage: string;                                  // Mensagem única do stash para idempotência
+  dbPayload: { column: string; value: string; agentId: string }; // O que será atualizado no DB
+  phase: IntentPhase;                                    // Estado atual
+  stashRef: string | null;                               // Referência do stash (ex: stash@{0})
+  createdAt: number;                                     // Timestamp em ms
+}
+```
+
+### Algoritmo de Recuperação Determinístico
+
+Ao boot, o `BootReconciler` lê todos os arquivos `.json` e `.tmp` no WAL dir e aplica a lógica abaixo **para cada intent pendente**:
+
+| Intent Phase | Ação | Razão |
+|---|---|---|
+| `INTENT_WRITTEN` | Marcar ROLLED_BACK + deletar arquivo WAL | Nada foi executado → abort limpo, estado seguro |
+| `GIT_STASH_DONE` | Validar stash existe; re-drive DB update (idempotente via WHERE) | Forward recovery — stash já existe, completar transação |
+| `DB_COMMITTED` | Apenas deletar arquivo WAL residual | Estado terminal de sucesso |
+| `ROLLED_BACK` | Apenas deletar arquivo WAL residual | Estado terminal de abort |
+
+**Invariante de Idempotência:** DB update é idempotente:
+```sql
+UPDATE agents SET state = ?, updatedAt = ? WHERE id = ?
+```
+Pode rodar múltiplas vezes sem efeito colateral. Se o sistema crash durante a re-execução, o próximo boot re-tenta a mesma operação.
+
+### Garantias de Durabilidade via fsync
+
+1. **Escrita no Arquivo Temporário:** Intent é serializado em `{txId}.json.tmp`
+2. **fsync do Arquivo Temp:** File descriptor é aberto, `fsync()` é chamado para garantir escrita em disco
+3. **Rename Atômico POSIX:** `fs.renameSync(temp, target)` — operação atômica, indivisível mesmo sob SIGKILL
+4. **Cleanup de Orphaned Temps:** Se SIGKILL ocorre entre fsync e rename, o arquivo `.tmp` fica como evidência — o BootReconciler detecta e limpa
+
+### Validação de Stash Idempotência
+
+No BootReconciler, antes de re-executar DB update para intent em phase `GIT_STASH_DONE`:
+
+```typescript
+const stashList = execFileSync('git', ['-C', intent.worktreePath, 'stash', 'list']).toString();
+if (!stashList.includes(intent.stashMessage)) {
+  // Stash desapareceu (pop manual ou limpeza?) → Rollback do DB também não é necessário
+  writeIntent({ ...intent, phase: 'ROLLED_BACK' });
+  cleanIntent(intent.txId);
+  return; // Transação considerada abortada
+}
+```
+
+Se stash ainda existe, re-executa o DB update e marca como `DB_COMMITTED`.
 
 ---
 
@@ -964,6 +1033,165 @@ export class LazyContextLoader {
   }
 }
 ```
+
+---
+
+## 2.8 CPGLoopDetector — Detecção Semântica de Loops com CPG + Execution Oracle
+
+**Propósito:** Detectar loops de agentes mesmo quando transformam código de forma semanticamente equivalente (ex: recursão → iteração, usando diferentes paradigmas). Resolve a vulnerabilidade de Tier 1/2/3 do LoopDetector v2.2 que falha em reformulações arquiteturais.
+
+### Componentes da Detecção
+
+#### 1. Extração de CPG Vector (Lightweight)
+
+```typescript
+interface CPGVector {
+  nodeTypeFrequency: Record<string, number>;  // Frequência de tipos de nó AST
+  dataFlowEdges: number;                       // Número de arestas de fluxo de dados
+  controlFlowDepth: number;                    // Profundidade máxima do CFG
+  sideEffectHash: string;                      // Hash dos efeitos colaterais observados
+}
+
+interface AgentRoundSnapshot {
+  roundIndex: number;
+  codeHash: string;
+  cpgVector: CPGVector;
+  testOutputHash: string;                      // Oracle de equivalência funcional
+  modifiedFiles: string[];
+  timestamp: number;
+}
+
+// Algoritmo de extração (simplificação do TreeCen, ~79x mais rápido que ASTNN):
+// 1. Parse AST via tree-sitter
+// 2. Contagem de frequência de node types (CallExpression, WhileStatement, etc)
+// 3. Análise CFG-lite: depth de nesting
+// 4. Efeitos colaterais: mutations, I/O, network calls
+// 5. Normaliza tudo em um vetor fixo de 128 dimensões
+```
+
+#### 2. Similaridade Semântica com Threshold Adaptativo
+
+```typescript
+// Comparação de dois CPG vectors
+function cpgSimilarity(v1: CPGVector, v2: CPGVector): number {
+  // Calcula cosine similarity entre frequências normalizadas
+  const freq1 = normalizeFrequencies(v1.nodeTypeFrequency);
+  const freq2 = normalizeFrequencies(v2.nodeTypeFrequency);
+  
+  const dot = Object.keys(freq1).reduce((sum, key) => {
+    return sum + (freq1[key] ?? 0) * (freq2[key] ?? 0);
+  }, 0);
+  
+  const mag1 = Math.sqrt(Object.values(freq1).reduce((s, v) => s + v * v, 0));
+  const mag2 = Math.sqrt(Object.values(freq2).reduce((s, v) => s + v * v, 0));
+  
+  return (mag1 > 0 && mag2 > 0) ? dot / (mag1 * mag2) : 0.0;
+}
+
+// Threshold adaptativo baseado em histórico:
+// - Se agente muda código 5 vezes por debate: threshold = 0.70 (mais tolerante)
+// - Se agente muda código 15 vezes: threshold = 0.75 (mais rigoroso)
+const adaptiveThreshold = 0.70 + (roundCount * 0.01); // Capped at 0.95
+const isSimilar = cpgSimilarity(current, previous) > adaptiveThreshold;
+```
+
+#### 3. Execution Oracle — Validação de Equivalência Funcional
+
+Quando CPG similarity dispara, valida se os outputs são realmente equivalentes:
+
+```typescript
+interface ExecutionOracleResult {
+  equivalent: boolean;
+  baselineOutput: string;
+  proposedOutput: string;
+  outputHash: string;
+}
+
+async function executeOracle(
+  baselineCode: string,
+  proposedCode: string,
+  worktreePath: string
+): Promise<ExecutionOracleResult> {
+  // 1. Escreve proposedCode em worktree
+  // 2. Roda testes existentes do projeto (npm test, pytest, etc)
+  // 3. Coleta stdout/stderr
+  // 4. Compara com output de baselineCode (cached de round anterior)
+  // 5. Se outputs idênticos → equivalência validada
+  // 6. Se outputs diferentes → não é loop, é genuína mudança
+  
+  const baselineOutput = lastRound.testOutputHash;
+  const proposedOutput = await runProjectTests(proposedCode, worktreePath);
+  
+  return {
+    equivalent: baselineOutput === crypto.createHash('sha256')
+      .update(proposedOutput).digest('hex'),
+    baselineOutput,
+    proposedOutput,
+    outputHash: crypto.createHash('sha256').update(proposedOutput).digest('hex'),
+  };
+}
+```
+
+### Detecção de Loop Completa
+
+```typescript
+async function detectSemanticLoop(
+  agentHistory: AgentRoundSnapshot[],
+  currentCode: string,
+  currentRound: number,
+  worktreePath: string
+): Promise<{ isLoop: boolean; reason: string }> {
+  
+  // 1. Extrai CPG da versão atual
+  const currentVector = extractCPGVector(currentCode);
+  const currentSnapshot: AgentRoundSnapshot = {
+    roundIndex: currentRound,
+    codeHash: crypto.createHash('sha256').update(currentCode).digest('hex'),
+    cpgVector: currentVector,
+    testOutputHash: '',  // Será preenchido por oracle
+    modifiedFiles: getModifiedFiles(worktreePath),
+    timestamp: Date.now(),
+  };
+  
+  // 2. Busca similares no histórico (últimas 10 rodadas)
+  const lookback = Math.min(10, currentRound);
+  for (let i = 0; i < lookback; i++) {
+    const prev = agentHistory[agentHistory.length - 1 - i];
+    if (!prev) continue;
+    
+    const similarity = cpgSimilarity(currentVector, prev.cpgVector);
+    const threshold = 0.70 + (i * 0.01); // Threshold adaptativo
+    
+    if (similarity > threshold) {
+      // 3. CPG é similar — valida com Execution Oracle
+      const oracleResult = await executeOracle(
+        agentHistory[agentHistory.length - 1 - i].codeHash,
+        currentCode,
+        worktreePath
+      );
+      
+      if (oracleResult.equivalent) {
+        return {
+          isLoop: true,
+          reason: `Código semanticamente equivalente detectado (CPG similarity: ${similarity.toFixed(2)}, outputs idênticos)`
+        };
+      } else {
+        // Codes são estruturalmente similares mas produzem outputs diferentes
+        // → Não é loop, é genuína refatoração com mudança de comportamento
+        console.log(`⚠️ CPG similar (${similarity.toFixed(2)}) mas outputs divergem — não é loop`);
+      }
+    }
+  }
+  
+  return { isLoop: false, reason: 'Nenhum loop semântico detectado' };
+}
+```
+
+### Impacto de Performance
+
+- **CPG Extraction:** ~50-100ms por round (amortizado entre agentes)
+- **Execution Oracle:** ~500ms (roda testes do projeto; acontece apenas após detecção CPG)
+- **Total:** Adição negligenciável à latência (dominante é chamada Gemini ~2s)
 
 ---
 

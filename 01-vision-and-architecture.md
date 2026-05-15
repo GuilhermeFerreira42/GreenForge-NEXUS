@@ -1,9 +1,9 @@
 # GreenForge Agent — 01: Visão e Arquitetura
 
-> **Status:** ✅ | **Versão:** 2.2 | **Data:** 2026-05-13  
-> **Referências:** Verdant AI Discovery Report, SRE Handbook, Martin Kleppmann (Distributed Systems), OpenHands V1, Bolt.diy
+> **Status:** ✅ | **Versão:** 2.3 | **Data:** 2026-05-15  
+> **Referências:** Verdant AI Discovery Report, SRE Handbook, Martin Kleppmann (Distributed Systems, WAL, Fencing Tokens), OpenHands V1, Bolt.diy, Code Property Graph (IBM)
 
-### 📋 Changelog v2.1.1 → v2.2 — Resumo de Imunidade Arquitetural
+### 📋 Changelog v2.2 → v2.3 — Hardening Crítico de Resiliência e Segurança
 
 | Categoria | Vulns Resolvidas | Status |
 |---|---|---|
@@ -348,6 +348,26 @@ interface FileScore {
 | **Alternativas Rejeitadas** | Monaco: ContentWidgets não são React-managed, causam desincronização de estado em re-renders. CodeMirror 5: API legada, sem suporte a TypeScript nativo. |
 | **Consequências** | (+) Inline Agent Tags totalmente integradas ao ciclo de estado React/Zustand. (-) Bundle ligeiramente diferente; usuários familiarizados com Monaco não perceberão diferença funcional. |
 | **Migração** | A API do editor é abstraida por `EditorAdapter` — mudanca transparente para o `DebateOrchestrator`. |
+
+### ADR-12: BootReconciler com WAL Intent Log (v2.3 — Resolutor de Estado Zumbi)
+| Campo | Valor |
+|---|---|
+| **Status** | ACEITA (v2.3) |
+| **Contexto** | SIGKILL entre `git stash push` e `prisma.checkpoint.update()` deixa stashes órfãos no filesystem sem referência no DB. Próximas operações podem aplicar esses stashes acidentalmente, corrompendo o estado. |
+| **Decisão** | Implementar Write-Ahead Log (WAL) Intent com 3 fases obrigatórias: (1) INTENT_WRITTEN, (2) GIT_STASH_DONE, (3) DB_COMMITTED. BootReconciler executa no startup e recupera de forma determinística: INTENT_WRITTEN → rollback limpo; GIT_STASH_DONE → re-drive DB (idempotente); fases terminais → limpeza de arquivo WAL. |
+| **Alternativas Rejeitadas** | Saga simples sem log persistido: vulnerável a crashes. Redis para WAL: adiciona infra. Simples retry: não garante idempotência. |
+| **Consequências** | (+) Zero stashes órfãos; Git e SQLite sempre sincronizados. (-) fsync antes de rename adiciona ~5-10ms de latência por checkpoint. |
+| **Mitigação** | WAL persistido em `.greenforge/wal/{txId}.json`; cleanup automático de arquivos `.tmp` orphaned; validação de idempotência de DB updates via WHERE clause. |
+
+### ADR-13: CPGLoopDetector com Execution Oracle (v2.3 — Defesa Contra Transformações de Paradigma)
+| Campo | Valor |
+|---|---|
+| **Status** | ACEITA (v2.3) |
+| **Contexto** | Agentes podem evadir LoopDetector v2.2 (Tiers AST/SimHash/SHA-256) transformando código de forma semanticamente equivalente: recursão → iteração com while → iteração com for. Cada transformação produz AST/shingles/hash distintos, evadindo todos os Tiers. |
+| **Decisão** | Integrar Code Property Graph (CPG) unindo AST + CFG + DFG para detecção de similaridade semântica com threshold 0.75 (mais sensível que SimHash 0.92). Validar com Execution Oracle: rodar testes do projeto com ambas as versões do código e comparar outputs. Se outputs idênticos + CPG similar → LOOP_SEMÂNTICO confirmado. |
+| **Alternativas Rejeitadas** | Tier 1+2+3 mantidos: insuficientes para reformulações arquiteturais. Limitar rounds a N: penaliza progresso legítimo. Apenas Execution Oracle: sem CPG, falsos positivos (códigos legítimos diferentes). |
+| **Consequências** | (+) Detecção de loops mesmo com paradigm shifts. (-) CPG extraction ~50-100ms por round; test execution adiciona ~500ms (amortizado 1x por debate). |
+| **Mitigação** | CPG extraction amortizada entre agentes; Execution Oracle acionado apenas após segundo hit de CPG similarity. |
 
 ---
 
