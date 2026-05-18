@@ -159,6 +159,33 @@ Deve haver uma `TopBar` e uma `StatusBar` fixas em todas as telas.
 
     - Transição: `width 0.3s ease-in-out`.
 
+### 1.2 Grid Tripartite Invariável — Especificação Canônica (v2.3)
+
+> **Regra de design inviolável:** As proporções do grid são um **contrato físico** — não podem ser ajustadas por preferências visuais. Cada proporção foi definida para otimizar o fluxo cognitivo: Coluna 1 apenas para navegação (mínimo), Coluna 2 para o debate (destaque), Coluna 3 para o artefato (substancial).
+
+| Coluna | Conteúdo | Proporção | Largura Mínima | Fundamento |
+|---|---|---|---|---|
+| **C1** | Navegador de Contexto / Painel de Agentes | `18%` | `220px` | Contém apenas árvore de arquivos e dots de atividade — informação compacta |
+| **C2** | Fluxo Dialético — Editor de Debate | `47%` | `auto` | Coluna central de maior atenção cognitiva — debate e tokens em streaming |
+| **C3** | Painel de Artefatos / Preview e File Tree | `35%` | `auto` | Artefato resultante do debate — substancial o suficiente para leitura de código |
+
+```css
+/* Implementação CSS do Grid Tripartite Invariável */
+.app-shell {
+  display: grid;
+  grid-template-columns: minmax(220px, 18%) 47% 35%;
+  grid-template-rows: 48px 1fr 28px; /* TopBar + Content + StatusBar */
+  height: 100vh;
+  overflow: hidden;
+}
+
+.col-navigator { grid-column: 1; grid-row: 2; }
+.col-dialectic { grid-column: 2; grid-row: 2; }
+.col-artifacts { grid-column: 3; grid-row: 2; }
+```
+
+> **Regra de responsividade:** Em viewports `< 1024px`, C1 colapsa para `0px` (oculta) e C2 expande para `65%`. Em viewports `< 768px` (mobile), layout troca para single-column. As proporções originais são restauradas em `>= 1024px`.
+
 - **StatusBar (Footer):**
 
     - Posição: `fixed`.
@@ -466,6 +493,153 @@ Quando `addAgentTag` é chamado com dois agentIds diferentes para o mesmo range:
 - Clicar no widget expande o raciocínio detalhado do agente.
 - Devem ser visualmente discretos para não atrapalhar o código.
 - A cor da tag deve seguir a identidade do agente (ver seção 2.2).
+
+#### Blueprint Completo: `AgentTagWidget` com Imunidade a Re-renderizações (Dossiê v2.3, GAP 2)
+
+> **Fonte:** Dossiê de Implementação v2.3, §2.2 — `AgentTagWidget` com `eq()`, `toDOM()`, `updateDOM()` e `destroy()`.
+> **Problema resolvido:** Sem `eq()` correto, o CodeMirror recria o nó DOM a cada keystroke → loop de renderização → cursor trava e foco é perdido durante streams de tokens.
+
+```typescript
+// agent-tag-widget.ts — Blueprint completo do WidgetType para GreenForge
+//
+// PRINCÍPIO: eq() === true → CM REUTILIZA o DOM (zero re-render)
+//            eq() === false → CM chama updateDOM() ou toDOM()
+import { WidgetType, EditorView, ViewPlugin, DecorationSet, Decoration, ViewUpdate } from '@codemirror/view';
+import { RangeSetBuilder } from '@codemirror/state';
+
+export interface AgentTagData {
+  agentId:    string;   // "agent-1", "agent-2", etc.
+  agentColor: string;   // Cor HEX: "#8b5cf6"
+  agentName:  string;   // Nome display: "Arquiteto"
+  lineFrom:   number;   // Linha inicial da modificação
+  lineTo:     number;   // Linha final da modificação
+  isActive:   boolean;  // Agente está executando ativamente?
+}
+
+export class AgentTagWidget extends WidgetType {
+  constructor(private readonly data: AgentTagData) { super(); }
+
+  /**
+   * CONTRATO: eq()
+   * Compara TODOS os campos que afetam o DOM visual.
+   * Se eq() retorna true para widgets com dados diferentes → cursor trava.
+   * NOTA: lineFrom/lineTo NÃO entram no eq() — determinam POSIÇÃO (gerida
+   * pelo RangeSet), não como o widget é renderizado.
+   */
+  eq(other: AgentTagWidget): boolean {
+    return (
+      this.data.agentId    === other.data.agentId    &&
+      this.data.agentColor === other.data.agentColor &&
+      this.data.agentName  === other.data.agentName  &&
+      this.data.isActive   === other.data.isActive
+    );
+  }
+
+  /**
+   * CONTRATO: toDOM()
+   * Chamado APENAS quando o widget é inserido pela primeira vez.
+   * Retorna um nó DOM completo e independente.
+   */
+  toDOM(_view: EditorView): HTMLElement {
+    const tag = document.createElement('span');
+    tag.className     = 'cm-agent-tag';
+    tag.dataset.agent = this.data.agentId;
+
+    const dot = tag.appendChild(document.createElement('span'));
+    dot.className = 'cm-agent-tag__dot';
+    dot.style.cssText = `
+      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+      background-color: ${this.data.agentColor}; margin-right: 4px; vertical-align: middle;
+      ${this.data.isActive ? 'animation: pulse 1.5s infinite;' : ''}
+    `;
+
+    const label = tag.appendChild(document.createElement('span'));
+    label.className   = 'cm-agent-tag__label';
+    label.textContent = this.data.agentName;
+    label.style.cssText = `
+      font-size: 10px; font-weight: 600; color: ${this.data.agentColor};
+      font-family: var(--font-mono); vertical-align: middle;
+    `;
+
+    tag.style.cssText = `
+      display: inline-flex; align-items: center; padding: 1px 6px;
+      border-radius: 3px; border: 1px solid ${this.data.agentColor}44;
+      background-color: ${this.data.agentColor}11; margin-left: 8px;
+      cursor: default; user-select: none;
+    `;
+    return tag;
+  }
+
+  /**
+   * CONTRATO: updateDOM()
+   * Chamado quando eq() retorna FALSE mas o widget é do MESMO TIPO
+   * e está na mesma posição — CM prefere atualizar a recriar.
+   * Faz mutação CIRÚRGICA do DOM existente.
+   * Retornar true = atualização bem-sucedida; false = força toDOM().
+   * Esta é a otimização que previne re-render a cada keystroke.
+   */
+  updateDOM(dom: HTMLElement, _view: EditorView): boolean {
+    const dot   = dom.querySelector<HTMLSpanElement>('.cm-agent-tag__dot');
+    const label = dom.querySelector<HTMLSpanElement>('.cm-agent-tag__label');
+    if (!dot || !label) return false; // DOM inválido → forçar recriação
+
+    if (dot.style.backgroundColor !== this.data.agentColor)
+      dot.style.backgroundColor = this.data.agentColor;
+
+    const shouldPulse = this.data.isActive;
+    const isPulsing   = dot.style.animationName === 'pulse';
+    if (shouldPulse !== isPulsing)
+      dot.style.animation = shouldPulse ? 'pulse 1.5s infinite' : 'none';
+
+    if (label.textContent !== this.data.agentName) label.textContent = this.data.agentName;
+    if (label.style.color !== this.data.agentColor) label.style.color = this.data.agentColor;
+
+    dom.dataset.agent = this.data.agentId;
+    return true; // DOM atualizado — não recriar
+  }
+
+  /**
+   * CONTRATO: destroy()
+   * Remove event listeners para prevenir memory leaks quando o widget
+   * sai do viewport (CodeMirror virtualiza widgets fora da janela visível).
+   */
+  destroy(dom: HTMLElement): void {
+    dom.removeEventListener('click', () => {});
+  }
+
+  /** ignoreEvent(): true = widget consome o evento; false = CM processa */
+  ignoreEvent(event: Event): boolean {
+    return event.type !== 'mousedown';
+  }
+}
+
+// ─── ViewPlugin: Cria e mantém os decorations ────────────
+export function agentTagPlugin(getAgentTags: () => Map<number, AgentTagData>) {
+  return ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+      constructor(view: EditorView) { this.decorations = this.buildDecorations(view); }
+      update(update: ViewUpdate) {
+        // Reconstruir APENAS se documento ou viewport mudou — não a cada keystroke
+        if (update.docChanged || update.viewportChanged)
+          this.decorations = this.buildDecorations(update.view);
+      }
+      buildDecorations(view: EditorView): DecorationSet {
+        const builder = new RangeSetBuilder<Decoration>();
+        for (const [lineNumber, tagData] of getAgentTags()) {
+          const line = view.state.doc.line(lineNumber);
+          builder.add(line.to, line.to, Decoration.widget({
+            widget: new AgentTagWidget(tagData),
+            side: 1, // Posicionar APÓS o caractere na posição `to`
+          }));
+        }
+        return builder.finish();
+      }
+    },
+    { decorations: instance => instance.decorations }
+  );
+}
+```
 
 ### 6.3 Componente: `IntegratedTerminalLogs`
 

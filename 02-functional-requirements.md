@@ -276,6 +276,104 @@ interface ChunkDiff {
 }
 ```
 
+#### Regra Técnica Estrita: Análise AST de Dependências Órfãs em Chunks Rejeitados (v2.3)
+
+> **Problema:** Quando o operador humano rejeita um chunk no Gate 2, ele pode estar rejeitando a *definição* de um símbolo (função, classe, constante) que outros chunks aprovados já *importam ou invocam*. O merge resultante quebraria o build sem aviso prévio.
+
+**Protocolo obrigatório ao rejeitar um chunk:**
+
+```typescript
+// src/core/DiffLens/OrphanDetector.ts
+// Executado SINCRONICAMENTE quando o usuário clica em [❌ Rejeitar] em qualquer ChunkDiff
+
+export interface OrphanAnalysisResult {
+  hasOrphans: boolean;
+  orphans: Array<{
+    symbol: string;          // Nome do símbolo: "parseJwtPayload", "AuthConfig", etc.
+    definedInChunk: string;  // chunkId do chunk rejeitado
+    referencedInChunks: string[]; // chunkIds dos chunks aprovados que usam o símbolo
+    referencedInFiles: string[];  // Arquivos que importam o símbolo
+  }>;
+  blocksMerge: boolean;      // true se algum símbolo é usado em chunk APPROVED
+}
+
+export async function detectOrphanedDependencies(
+  rejectedChunk: ChunkDiff,
+  allChunks: ChunkDiff[],
+  projectRoot: string
+): Promise<OrphanAnalysisResult> {
+  // 1. Parsear os addedLines do chunk rejeitado via tree-sitter
+  //    para extrair todos os símbolos DEFINIDOS (FunctionDeclaration,
+  //    ClassDeclaration, VariableDeclaration com export)
+  const definedSymbols = await extractDefinedSymbols(rejectedChunk.addedLines);
+
+  if (definedSymbols.length === 0) {
+    return { hasOrphans: false, orphans: [], blocksMerge: false };
+  }
+
+  // 2. Para cada símbolo definido, buscar referências em:
+  //    a) Chunks com status 'accepted' na sessão atual
+  //    b) Arquivos existentes do projeto (search_codebase)
+  const orphans: OrphanAnalysisResult['orphans'] = [];
+
+  for (const symbol of definedSymbols) {
+    const referencedInChunks = allChunks
+      .filter(c => c.status === 'accepted' && chunkReferencesSymbol(c, symbol))
+      .map(c => c.chunkId);
+
+    const referencedInFiles = await searchSymbolInProject(symbol, projectRoot);
+
+    if (referencedInChunks.length > 0 || referencedInFiles.length > 0) {
+      orphans.push({ symbol, definedInChunk: rejectedChunk.chunkId, referencedInChunks, referencedInFiles });
+    }
+  }
+
+  return {
+    hasOrphans: orphans.length > 0,
+    orphans,
+    // O merge é BLOQUEADO se algum símbolo órfão é referenciado em chunk APPROVED
+    // (garante que o build não quebrará)
+    blocksMerge: orphans.some(o => o.referencedInChunks.length > 0),
+  };
+}
+```
+
+**Comportamento da UI ao detectar órfãos:**
+
+```
+Usuário clica [❌ Rejeitar] no chunk que define `parseJwtPayload()`
+
+→ OrphanDetector.detectOrphanedDependencies() executa (< 500ms)
+
+→ SE blocksMerge === true:
+   Modal de bloqueio (não pode ser ignorado):
+   ┌─────────────────────────────────────────────────────────────┐
+   │  ⚠️  DEPENDÊNCIAS ÓRFÃS DETECTADAS — MERGE BLOQUEADO       │
+   │  ─────────────────────────────────────────────────────────  │
+   │  Ao rejeitar este chunk, os seguintes símbolos ficam        │
+   │  indefinidos em chunks já aprovados:                        │
+   │                                                             │
+   │  • parseJwtPayload — usado em: chunk-03 (auth.ts:L22)      │
+   │  • AuthConfig — importado em: chunk-07 (middleware.ts:L5)  │
+   │                                                             │
+   │  Ações disponíveis:                                         │
+   │  [ Revisar Chunks Dependentes ]   [ Cancelar Rejeição ]     │
+   │  [ Forçar Rejeição (quebrará o build) ]                     │
+   └─────────────────────────────────────────────────────────────┘
+   → Pipeline de merge TRAVADO até resolução
+
+→ SE hasOrphans === true mas blocksMerge === false:
+   Toast de aviso não-bloqueante (5s):
+   "⚠ O símbolo 'parseJwtPayload' era usado em middleware.ts (arquivo existente).
+    Certifique-se de que a definição ainda existe no projeto."
+   → Merge permitido; responsabilidade é do operador
+```
+
+**Critério de aceite (RF-06 expandido):**
+- `blocksMerge === true` → botão `[Confirmar Merge]` fica desabilitado até o operador resolver os órfãos
+- O estado da análise AST é persistido no `ChunkDiff.status === 'rejected'` com campo `orphanAnalysis?: OrphanAnalysisResult`
+- A análise é re-executada se o operador aceitar um chunk que estava marcado como dependente
+
 ---
 
 ### 2.5 Rollback Pós-Merge

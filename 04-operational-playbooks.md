@@ -471,3 +471,192 @@ sqlite3 .greenforge/db.sqlite \
 | **5** | Segurança | Testar rollback; verificar redação de segredos nos logs |
 | **6** | Resiliência | Simular 429; testar GC; verificar reconexão SSE |
 | **7** | Pipeline completo | Sessão end-to-end: clarificação → debate → Gate 1 → Gate 2 → merge → rollback |
+
+---
+
+## 4.5 Protocolo de Graceful Shutdown — Hierarquia de 8 Estágios (v2.3)
+
+> **Fonte:** Dossiê de Implementação v2.3, GAP 4 — Graceful Shutdown com `better-sqlite3`
+> **Princípio:** A ordem dos estágios é determinística e inviolável. O Estágio 8 é o **ponto de consistência final** — garante que nenhuma write do WAL seja perdida antes do processo terminar.
+
+### Tabela de Prioridades de Shutdown
+
+| Prioridade | Componente | Ação | Motivo | Timeout |
+|:---:|---|---|---|:---:|
+| **1** | HTTP/SSE listeners | `server.close()` — para aceitar novas conexões | Novas requests podem criar transações enquanto shutdown ocorre | 2s |
+| **2** | SSE streams ativos | Enviar `event: shutdown` + fechar streams | Clientes sabem se reconectar com backoff exponencial | 1s |
+| **3** | WebSocket clients | Enviar close frame 1001 "Going Away" + aguardar ACK | Protocolo correto de encerramento WS; força close após 5s | 6s |
+| **4** | Agent loops | Setar flag `isShuttingDown = true` + aguardar round atual | Não interromper operação no meio de um round de debate | 15s |
+| **5** | Background workers | `worker.drain()` + aguardar jobs em progresso | Jobs de checkpoint e indexação devem finalizar | 15s |
+| **6** | CodeMirror SSR | `editorView.destroy()` + flush de operações pendentes | Previne leaks de workers do Lezer parser em ambientes SSR | 1s |
+| **7** | ORM/Prisma pool | `prisma.$disconnect()` | Fecha pool de conexões graciosamente — deve vir após agents pararem | 5s |
+| **8** | **WAL Checkpoint** | `db.pragma('wal_checkpoint(FULL)')` + `db.close()` | **CRÍTICO:** Garante durabilidade de TODAS as writes; último estágio obrigatório | 30s |
+
+> **Por que o Estágio 8 é crítico:** Em WAL mode, o SQLite escreve primeiro no `.wal` e só mescla ao arquivo principal durante um checkpoint. Sem `wal_checkpoint(FULL)` no shutdown, writes recentes ficam apenas no `.wal` — se o processo morrer antes de um checkpoint automático, essas writes são perdidas. O `db.close()` do `better-sqlite3` garante um `fsync` final antes de fechar o file descriptor.
+
+### Blueprint Completo: `graceful-shutdown.ts` (v2.3)
+
+```typescript
+// graceful-shutdown.ts — GreenForge v2.3
+import { createServer, type Server } from 'http';
+import type { WebSocket }            from 'ws';
+import Database                      from 'better-sqlite3';
+
+interface SSEClient {
+  id: string;
+  response: { write: (data: string) => void; end: () => void };
+}
+
+interface ShutdownRegistry {
+  httpServer:     Server | null;
+  sseClients:     Set<SSEClient>;
+  wsClients:      Set<WebSocket>;
+  agentLoops:     Map<string, { stop: () => Promise<void> }>;
+  backgroundJobs: Map<string, { drain: () => Promise<void> }>;
+  prismaClient:   { $disconnect: () => Promise<void> } | null;
+  db:             Database.Database | null;
+}
+
+const registry: ShutdownRegistry = {
+  httpServer: null, sseClients: new Set(), wsClients: new Set(),
+  agentLoops: new Map(), backgroundJobs: new Map(), prismaClient: null, db: null,
+};
+
+export const GracefulShutdown = {
+  registerHTTPServer:    (s: Server)                                       => { registry.httpServer = s; },
+  registerSSEClient:     (c: SSEClient)                                    => registry.sseClients.add(c),
+  deregisterSSEClient:   (c: SSEClient)                                    => registry.sseClients.delete(c),
+  registerWSClient:      (ws: WebSocket)                                   => registry.wsClients.add(ws),
+  deregisterWSClient:    (ws: WebSocket)                                   => registry.wsClients.delete(ws),
+  registerAgentLoop:     (id: string, loop: { stop: () => Promise<void> }) => registry.agentLoops.set(id, loop),
+  registerBackgroundJob: (id: string, job: { drain: () => Promise<void> }) => registry.backgroundJobs.set(id, job),
+  registerPrisma:        (p: { $disconnect: () => Promise<void> })         => { registry.prismaClient = p; },
+  registerSQLite:        (db: Database.Database)                           => { registry.db = db; },
+};
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`[SHUTDOWN TIMEOUT] ${label} exceeded ${ms}ms`)), ms)),
+  ]);
+}
+
+async function logStage(stage: number, name: string, fn: () => Promise<void>, ms: number): Promise<void> {
+  const start = Date.now();
+  console.log(`[SHUTDOWN] Stage ${stage}: ${name} — starting...`);
+  try {
+    await withTimeout(fn(), ms, name);
+    console.log(`[SHUTDOWN] Stage ${stage}: ${name} — ✅ ${Date.now() - start}ms`);
+  } catch (err) {
+    console.error(`[SHUTDOWN] Stage ${stage}: ${name} — ⚠️ ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+let isShuttingDown = false;
+
+export async function gracefulShutdown(signal: 'SIGTERM' | 'SIGINT'): Promise<void> {
+  if (isShuttingDown) { console.warn('[SHUTDOWN] Already in progress.'); return; }
+  isShuttingDown = true;
+  console.log(`\n[SHUTDOWN] Received ${signal}. Starting 8-stage graceful shutdown...`);
+
+  // Estágio 1: HTTP
+  await logStage(1, 'HTTP Server Stop', async () => {
+    if (!registry.httpServer) return;
+    await new Promise<void>((resolve, reject) => registry.httpServer!.close(e => e ? reject(e) : resolve()));
+  }, 2_000);
+
+  // Estágio 2: SSE
+  await logStage(2, 'SSE Streams', async () => {
+    for (const client of [...registry.sseClients]) {
+      try { client.response.write(`event: shutdown\ndata: ${JSON.stringify({ reason: signal, reconnect: true })}\n\n`); client.response.end(); } catch {}
+    }
+    registry.sseClients.clear();
+  }, 1_000);
+
+  // Estágio 3: WebSocket (close frame 1001 "Going Away")
+  await logStage(3, 'WebSocket Clients', async () => {
+    for (const ws of [...registry.wsClients]) {
+      try { ws.send(JSON.stringify({ type: 'server-shutdown' })); ws.close(1001, 'Server shutting down'); } catch {}
+    }
+    const deadline = Date.now() + 5_000;
+    while (registry.wsClients.size > 0 && Date.now() < deadline) await new Promise(r => setTimeout(r, 100));
+    for (const ws of registry.wsClients) { try { ws.terminate(); } catch {} }
+    registry.wsClients.clear();
+  }, 6_000);
+
+  // Estágio 4: Agent Loops
+  await logStage(4, 'Agent Loops', async () => {
+    await Promise.allSettled([...registry.agentLoops.entries()].map(([id, l]) => {
+      console.log(`[SHUTDOWN:AGENTS] Stopping: ${id}`); return l.stop();
+    }));
+    registry.agentLoops.clear();
+  }, 15_000);
+
+  // Estágio 5: Background Workers
+  await logStage(5, 'Background Workers', async () => {
+    await Promise.allSettled([...registry.backgroundJobs.entries()].map(([id, j]) => {
+      console.log(`[SHUTDOWN:WORKERS] Draining: ${id}`); return j.drain();
+    }));
+    registry.backgroundJobs.clear();
+  }, 15_000);
+
+  // Estágio 6: CodeMirror SSR (no-op em client-only)
+  await logStage(6, 'CodeMirror SSR Cleanup', async () => {
+    console.log('[SHUTDOWN:CM] no-op in client-only mode.');
+  }, 1_000);
+
+  // Estágio 7: Prisma
+  await logStage(7, 'Prisma Disconnect', async () => {
+    if (!registry.prismaClient) return;
+    await registry.prismaClient.$disconnect();
+  }, 5_000);
+
+  // Estágio 8 — CRÍTICO: WAL Checkpoint + fsync + Close
+  await logStage(8, 'SQLite WAL Checkpoint + fsync + Close', async () => {
+    if (!registry.db) return;
+    try {
+      const [{ busy, log, checkpointed }] = registry.db.pragma('wal_checkpoint(FULL)') as Array<{
+        busy: number; log: number; checkpointed: number;
+      }>;
+      console.log(`[SHUTDOWN:SQLITE] WAL checkpoint: busy=${busy}, log=${log}, checkpointed=${checkpointed}`);
+      if (busy > 0) {
+        console.warn('[SHUTDOWN:SQLITE] Readers active. Trying TRUNCATE checkpoint...');
+        registry.db.pragma('wal_checkpoint(TRUNCATE)');
+      }
+      registry.db.close(); // fsync implícito antes de fechar file descriptor
+      console.log('[SHUTDOWN:SQLITE] ✅ Database closed with full WAL checkpoint.');
+    } catch (err) {
+      console.error('[SHUTDOWN:SQLITE] ❌ SQLite close error:', err);
+      try { registry.db.close(); } catch {}
+    }
+  }, 30_000);
+
+  console.log(`\n[SHUTDOWN] ✅ All 8 stages complete. Exiting.`);
+  process.exit(0);
+}
+
+export function registerShutdownHandlers(): void {
+  process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+  process.on('SIGINT',  () => void gracefulShutdown('SIGINT'));
+  process.on('uncaughtException',  (err)    => { console.error('[FATAL]', err);    void gracefulShutdown('SIGTERM'); });
+  process.on('unhandledRejection', (reason) => { console.error('[FATAL]', reason); void gracefulShutdown('SIGTERM'); });
+}
+```
+
+### Integração no `server.ts`
+
+```typescript
+import { GracefulShutdown, registerShutdownHandlers } from './graceful-shutdown';
+import Database from 'better-sqlite3';
+
+const db = new Database('./greenforge.db');
+db.pragma('journal_mode = WAL');    // WAL mode obrigatório
+db.pragma('synchronous = NORMAL'); // Balance durabilidade/performance
+
+GracefulShutdown.registerSQLite(db);
+GracefulShutdown.registerHTTPServer(httpServer);
+GracefulShutdown.registerPrisma(prisma);
+registerShutdownHandlers();
+```
+

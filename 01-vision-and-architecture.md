@@ -454,6 +454,33 @@ VARIÁVEIS DE AMBIENTE (.env):
 
 ---
 
+### 5.4 Justificativa de Design de Imunidade (Mapeamento CVE)
+
+> **Fonte:** Dossiê de Implementação v2.3 — GreenForge NEXUS, Blueprints de Engenharia de Infraestrutura, §3.1 "Base de CVEs Relevantes para o GreenForge".
+> **Propósito:** Justificar cada decisão de design de segurança com base em vulnerabilidades reais documentadas em Git e ferramentas de CI/CD. A coluna "Defesa no GreenForge" mapeia cada CVE à implementação canônica presente no `secureGit` wrapper (§4 do `05-governance-and-security.md`).
+
+| CVE | Vetor de Ataque | Gap Coberto | Defesa no GreenForge v2.3 |
+|---|---|---|---|
+| **CVE-2026-3854** | Push option injection → env override → RCE em servidores CI/CD | GAP 3 (secureGit) | `FORBIDDEN_ENV_VARS` (Set com 18 entradas) + `execa` com `spawn({shell: false})` implícito |
+| **CVE-2026-25763** | `git log --output=<path>` → escrita arbitrária de arquivo no filesystem | GAP 3 (secureGit) | `forbiddenFlags: new Set(['--output', '--exec'])` na política `log` do `GIT_POLICY` |
+| **CVE-2025-68144** | `git diff --output=<path>` / `--no-index` → Local File Inclusion (LFI) | GAP 3 (secureGit) | `forbiddenFlags: new Set(['--no-index', '--output', '--ext-diff', '--textconv'])` na política `diff` |
+| **CVE-2023-29007** | Injeção de config Git arbitrária via `core.pager`, `core.editor`, `core.sshCommand` | GAP 3 (secureGit) | Delete de `GIT_PAGER`, `PAGER`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_VALUE_0`, `GIT_EDITOR`, `EDITOR` do env antes de cada exec |
+| **CVE-2017-8386** | Escalada de privilégios via `git-shell` pager bypass usando `less --help` | GAP 3 (secureGit) | Delete de `PAGER`, `LESS`, `MANPAGER`; forçar `TERM=dumb` + `GIT_TERMINAL_PROMPT=0` |
+| **N/A** | `SharedArrayBuffer` bloqueado por ausência de Cross-Origin-Isolation | GAP 1 (Vite/Nginx) | Headers COOP `same-origin` + COEP `require-corp` no plugin Vite e no nginx.conf |
+| **N/A** | `WidgetType` re-render a cada keystroke → loop de DOM no CodeMirror 6 | GAP 2 (CodeMirror) | Método `eq()` comparando todos os campos visuais + `updateDOM()` para mutação cirúrgica |
+| **N/A** | SQLite WAL não checkpointed no shutdown → writes perdidos em crash de processo | GAP 4 (Shutdown) | `db.pragma('wal_checkpoint(FULL)')` obrigatório no Estágio 8 do `gracefulShutdown()` |
+
+**Princípio de Defesa em Profundidade:** Cada CVE da tabela acima é mitigado em pelo menos **2 camadas independentes**:
+
+1. **Camada de Schema (Zod):** Rejeita inputs malformados antes de qualquer lógica de negócio
+2. **Camada de Allowlist (GIT_POLICY):** Rejeita subcomandos/flags não-listados explicitamente
+3. **Camada de Ambiente (buildSanitizedEnv):** Remove variáveis perigosas do `process.env` antes de cada `execa`
+4. **Camada de Path (realpath):** Resolve symlinks e confina operações ao `worktreePath`
+
+Qualquer operação Git que passe por todas as 4 camadas sem ser rejeitada é considerada **provably safe** para o modelo de ameaça do GreenForge (single-user, localhost, sem exposição de rede).
+
+---
+
 ## 8. Roadmap
 
 | Versão | Foco |

@@ -20,6 +20,60 @@ Reconexão: automática via `Last-Event-ID` header (browser nativo)
 
 **Prevenção de Memory Leak:** Cada conexão SSE deve obrigatoriamente atrelar um `AbortController` ao `req.signal.addEventListener('abort', cleanup)` para remover listeners do `EventLog` imediatamente após desconexão.
 
+#### Contrato Técnico: AbortController Acoplado ao `req.signal` (v2.3)
+
+```typescript
+// src/transport/SSETransport.ts — Padrão obrigatório de prevenção de memory leak
+export function handleSSEConnection(req: Request, res: Response): void {
+  const connectionId = `sse-${req.params.sessionId}-${Date.now()}`;
+
+  // Headers SSE obrigatórios
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Desabilita buffering em Nginx
+  res.flushHeaders();
+
+  // AbortController acoplado ao sinal de desconexão da request
+  const controller = new AbortController();
+  const { signal } = controller;
+
+  GracefulShutdown.registerSSEClient({ id: connectionId, response: res });
+
+  // CONTRATO CRÍTICO: req.signal dispara IMEDIATAMENTE no TCP RST/aba fechada
+  // Não espera garbage collector — cleanup determinístico
+  req.signal.addEventListener('abort', () => {
+    controller.abort();
+    eventLog.removeAllListenersForConnection(connectionId);
+    GracefulShutdown.deregisterSSEClient({ id: connectionId, response: res });
+  }, { once: true }); // { once: true } previne leak do próprio listener
+
+  // Heartbeat a cada 15s para prevenir timeout de proxies
+  const heartbeat = setInterval(() => {
+    if (signal.aborted) { clearInterval(heartbeat); return; }
+    try { res.write(': keep-alive\n\n'); } catch { clearInterval(heartbeat); }
+  }, 15_000);
+
+  // Subscrever eventos passando o AbortSignal para cancelamento automático
+  eventLog.subscribe(req.params.sessionId, (event) => {
+    if (signal.aborted) return;
+    try {
+      res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+    } catch { controller.abort(); }
+  }, { signal });
+}
+
+// TTL de segurança: cleanup automático de conexões zumbi após 24h
+// Cobre casos onde req.signal falha (crash de processo, conexão irrecuperável)
+const SSE_MAX_AGE_MS = parseInt(process.env['SSE_EVENT_MAX_AGE_MS'] ?? '86400000');
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, conn] of activeConnections) {
+    if (now - parseInt(id.split('-').pop()!) > SSE_MAX_AGE_MS) conn.controller.abort();
+  }
+}, 60_000);
+```
+
 > **v2.2 — vuln #7:** Além do cleanup de listeners, o `EventLog` da sessão é completamente removido da memória quando a `DebateSession` atinge status `COMPLETED`, `ABORTED` ou `MERGED`. O `SSETransport.onSessionTerminated(sessionId)` DEVE ser chamado pelo `DebateOrchestrator` ao transitar para qualquer um desses estados. Um TTL de 24h (configurável via `SSE_EVENT_MAX_AGE_MS`) garante limpeza even se o callback for perdido.
 
 ### 1.1 Catálogo de Eventos
