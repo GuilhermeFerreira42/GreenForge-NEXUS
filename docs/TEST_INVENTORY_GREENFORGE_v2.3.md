@@ -21,6 +21,10 @@
 
 ## 🛡️ Suite SEC — Segurança e Blindagem de Shell (`secureGit`)
 
+> **[Status de Auditoria]: ✅ FUNCIONAL / TESTADO** 
+> * **Realidade**: O módulo `secure-git-wrapper.ts` e a rota `app/api/shell` existem e executam comandos de verdade através de `execa`.
+> * **Falha resolvida**: A infraestrutura de testes automatizados (`vitest`) agora está contida em `GreenForge-testes/`. A suíte rodou com sucesso, passando todos os 38 casos de uso mapeados para blindagem. A lógica e a infraestrutura estão plenamente integradas e seguras.
+
 > Cobre: `secure-git-wrapper.ts` v2.3, `FORBIDDEN_ENV_VARS`, `GIT_POLICY`, validação Zod, `buildSanitizedEnv()`, `validateFlag()`, `validateAndResolvePath()`, tabela de attack vectors (CVE-2026-3854, CVE-2026-25763, CVE-2025-68144, CVE-2023-29007, CVE-2017-8386).
 
 ---
@@ -181,6 +185,10 @@
 
 ## 🌀 Suite RES — Resiliência de Infraestrutura (`BootReconciler` + Lifecycle)
 
+> **[Status de Auditoria]: ❌ MOCK / INEXISTENTE** 
+> * **Realidade**: Nenhum vestígio do `BootReconciler`, SQLite WAL, `PrismaClient` ou `PreExecutionGuard` foram encontrados no código fonte base (`greenforge-ide/`).
+> * **Falha**: Toda essa suíte se refere a abstrações não implementadas ou componentes simulados. Não existe banco de dados real salvando esses metadados, causando total falta de persistência em caso de restarts.
+
 > Cobre: `BootReconciler`, `writeIntent()`, `IntentPhase` state machine, `graceful-shutdown.ts` (8 estágios), `RuntimeContainer`, `CPGLoopDetector`, `PreExecutionGuard` (OCC + HMAC + epoch_id).
 
 ---
@@ -317,6 +325,10 @@
 
 ## 🔍 Suite BIZ — Lógica de Negócio e Análise AST (`DiffLens`)
 
+> **[Status de Auditoria]: ⚠️ PARCIAL / SIMULADO VISUALMENTE** 
+> * **Realidade**: A arquitetura de interface existe (painel DiffLens). Existe comunicação real com a inteligência artificial (Gemini) na rota de debate.
+> * **Falha**: A API em `app/api/debate` é fixa (harcoded). O fluxo gera um "Approval Gate HITL" de forma estática ao final de um turno simulado de "propositor/crítico", ao invés de ler e alterar AST / dependências de código real de forma contínua. Logo, a abstração toda de `CostGuardrail`, `AutoFixLimiter` ou manipulação granular all-or-nothing é falsa no backend.
+
 > Cobre: `DiffLens` (Gate HITL 2), aprovação/rejeição de chunks, rollback all-or-nothing pós-merge, contrato de squash merge, análise estática de dependências órfãs, `CostGuardrail`, `AutoFixLimiter`.
 
 ---
@@ -408,6 +420,10 @@
 ---
 
 ## 🎨 Suite UX — Performance e Fidelidade de Interface (`CodeMirror 6`)
+
+> **[Status de Auditoria]: ✅ FUNCIONAL (Com ressalvas)** 
+> * **Realidade**: CodeMirror 6 de fato está no `package.json` e sendo renderizado nas views da IDE. A sincronização de interface em tempo real via stream ocorre ativamente.
+> * **Falha**: Localmente, as headers de isolamento `COOP/COEP` para ativação de `SharedArrayBuffer` geralmente requerem setup de proxy/NextJS. Sem isso o parser pode operar em modo de "fallback", o que o sistema previu (como UX-005 documenta). No geral, a camada UI/UX está viva e real.
 
 > Cobre: `AgentTagWidget.eq()`, `updateDOM()`, `toDOM()`, `destroy()`, headers COOP/COEP, `RAFBufferedSSEConsumer`, fallback de `SharedArrayBuffer`, `ThreadedParser`, idempotência de decorations.
 
